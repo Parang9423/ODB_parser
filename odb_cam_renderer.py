@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 Point = Tuple[float, float]
 
@@ -51,6 +51,22 @@ class Repeat:
     ny: int
     angle: float
     mirror: bool
+
+
+@dataclass(frozen=True)
+class CompositeLayer:
+    layer: str
+    operation: str = "ADD"
+    gv: int = 255
+
+    def normalized(self) -> "CompositeLayer":
+        op = self.operation.upper()
+        if op not in {"ADD", "REPLACE", "SUBTRACT"}:
+            raise ValueError(f"Unsupported composite operation: {self.operation}")
+        gv = int(self.gv)
+        if not 0 <= gv <= 255:
+            raise ValueError("Composite GV must be between 0 and 255")
+        return CompositeLayer(self.layer, op, gv)
 
 
 @dataclass
@@ -374,6 +390,36 @@ class ODBRenderer:
                               margin_px=margin_px, background=0)
         self._render_step_recursive(canvas, step.lower(), layer.lower(), Transform())
         return canvas.image
+
+    def render_composite(self, step: str, layers: Sequence[CompositeLayer], margin_px: int = 0,
+                         background: int = 0) -> Image.Image:
+        """Render ordered ODB++ layers into an 8-bit grayscale composite image."""
+        specs = [spec.normalized() for spec in layers]
+        if not specs:
+            raise ValueError("At least one composite layer is required")
+        if not 0 <= int(background) <= 255:
+            raise ValueError("Composite background must be between 0 and 255")
+
+        result: Optional[Image.Image] = None
+        for spec in specs:
+            mask_image = self.render(step, spec.layer, margin_px=margin_px)
+            mask = mask_image.point(lambda value: 255 if value > 0 else 0, mode="L")
+            if result is None:
+                result = Image.new("L", mask_image.size, color=int(background))
+            elif result.size != mask_image.size:
+                raise ODBError("Composite layer dimensions do not match")
+
+            if spec.operation == "REPLACE":
+                result.paste(spec.gv, mask=mask)
+            elif spec.operation == "SUBTRACT":
+                result.paste(0, mask=mask)
+            else:
+                contribution = Image.new("L", result.size, color=0)
+                contribution.paste(spec.gv, mask=mask)
+                result = ImageChops.lighter(result, contribution)
+
+        assert result is not None
+        return result
 
 
 def locate_job_dir(root: Path) -> Path:
