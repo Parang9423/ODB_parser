@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal ODB++ CAM raster renderer for AOI reference-image generation."""
+"""ODB++ CAM raster renderer for AOI reference-image generation."""
 from __future__ import annotations
 
 import argparse
@@ -27,7 +27,7 @@ class Transform:
 
     def apply(self, p: Point) -> Point:
         x, y = p
-        return (self.a * x + self.b * y + self.tx, self.c * x + self.d * y + self.ty)
+        return self.a * x + self.b * y + self.tx, self.c * x + self.d * y + self.ty
 
     def compose(self, child: "Transform") -> "Transform":
         return Transform(
@@ -85,20 +85,17 @@ def parse_kv_blocks(path: Path, block_name: str) -> List[Dict[str, str]]:
 def parse_repeats(stephdr: Path) -> List[Repeat]:
     if not stephdr.exists():
         return []
-    out: List[Repeat] = []
-    for block in parse_kv_blocks(stephdr, "STEP-REPEAT"):
-        out.append(Repeat(
-            name=block.get("NAME", "").lower(),
-            x=float(block.get("X", 0)),
-            y=float(block.get("Y", 0)),
-            dx=float(block.get("DX", 0)),
-            dy=float(block.get("DY", 0)),
-            nx=int(block.get("NX", 1)),
-            ny=int(block.get("NY", 1)),
-            angle=float(block.get("ANGLE", 0)),
-            mirror=block.get("MIRROR", "NO").upper() == "YES",
-        ))
-    return out
+    return [
+        Repeat(
+            name=b.get("NAME", "").lower(),
+            x=float(b.get("X", 0)), y=float(b.get("Y", 0)),
+            dx=float(b.get("DX", 0)), dy=float(b.get("DY", 0)),
+            nx=int(b.get("NX", 1)), ny=int(b.get("NY", 1)),
+            angle=float(b.get("ANGLE", 0)),
+            mirror=b.get("MIRROR", "NO").upper() == "YES",
+        )
+        for b in parse_kv_blocks(stephdr, "STEP-REPEAT")
+    ]
 
 
 def repeat_transform(x: float, y: float, angle_deg: float, mirror: bool) -> Transform:
@@ -151,8 +148,8 @@ def parse_profile_contours(profile: Path) -> List[Tuple[str, List[Point]]]:
         elif tokens[0] == "OS" and current is not None:
             current.append((float(tokens[1]), float(tokens[2])))
         elif tokens[0] == "OC" and current is not None:
-            end = (float(tokens[1]), float(tokens[2]))
-            center = (float(tokens[3]), float(tokens[4]))
+            end = float(tokens[1]), float(tokens[2])
+            center = float(tokens[3]), float(tokens[4])
             current.extend(arc_points(current[-1], end, center, tokens[5].upper().startswith("Y")))
         elif tokens[0] == "OE" and current:
             contours.append((kind, current))
@@ -201,25 +198,30 @@ def round_symbol_diameter_in(symbol: str) -> Optional[float]:
 
 
 class RasterCanvas:
-    def __init__(self, bounds: Tuple[float, float, float, float], dpi: float, margin_px: int = 0, background: int = 0):
+    def __init__(self, bounds: Tuple[float, float, float, float], dpi_x: float,
+                 dpi_y: Optional[float] = None, margin_px: int = 0, background: int = 0):
         self.xmin, self.ymin, self.xmax, self.ymax = bounds
-        self.dpi = float(dpi)
+        self.dpi_x = float(dpi_x)
+        self.dpi_y = float(dpi_x if dpi_y is None else dpi_y)
+        self.dpi = self.dpi_x
         self.margin = int(margin_px)
-        width = max(1, int(math.ceil((self.xmax - self.xmin) * dpi)) + 2 * self.margin)
-        height = max(1, int(math.ceil((self.ymax - self.ymin) * dpi)) + 2 * self.margin)
+        width = max(1, int(math.ceil((self.xmax - self.xmin) * self.dpi_x)) + 2 * self.margin)
+        height = max(1, int(math.ceil((self.ymax - self.ymin) * self.dpi_y)) + 2 * self.margin)
         self.image = Image.new("L", (width, height), color=background)
         self.draw = ImageDraw.Draw(self.image)
 
     def px(self, p: Point) -> Tuple[float, float]:
         x, y = p
-        return ((x - self.xmin) * self.dpi + self.margin, (self.ymax - y) * self.dpi + self.margin)
+        return ((x - self.xmin) * self.dpi_x + self.margin,
+                (self.ymax - y) * self.dpi_y + self.margin)
 
-    def draw_round_pad(self, p: Point, diameter_in: float, value: int):
+    def draw_round_pad(self, p: Point, diameter_in: float, value: int) -> None:
         x, y = self.px(p)
-        radius = diameter_in * self.dpi / 2.0
-        self.draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=value)
+        rx, ry = diameter_in * self.dpi_x / 2.0, diameter_in * self.dpi_y / 2.0
+        self.draw.ellipse((x - rx, y - ry, x + rx, y + ry), fill=value)
 
-    def draw_rect_pad(self, center: Point, width_in: float, height_in: float, value: int, angle_deg: float = 0.0, transform: Transform = Transform()):
+    def draw_rect_pad(self, center: Point, width_in: float, height_in: float, value: int,
+                      angle_deg: float = 0.0, transform: Transform = Transform()) -> None:
         cx, cy = center
         half_w, half_h = width_in / 2.0, height_in / 2.0
         theta = math.radians(angle_deg)
@@ -230,15 +232,15 @@ class RasterCanvas:
             points.append(self.px(transform.apply((xr, yr))))
         self.draw.polygon(points, fill=value)
 
-    def draw_round_line(self, p1: Point, p2: Point, width_in: float, value: int):
+    def draw_round_line(self, p1: Point, p2: Point, width_in: float, value: int) -> None:
         start, end = self.px(p1), self.px(p2)
-        width = max(1, int(round(width_in * self.dpi)))
+        width = max(1, int(round(width_in * math.sqrt(self.dpi_x * self.dpi_y))))
         self.draw.line((start, end), fill=value, width=width)
-        radius = width_in * self.dpi / 2.0
+        rx, ry = width_in * self.dpi_x / 2.0, width_in * self.dpi_y / 2.0
         for x, y in (start, end):
-            self.draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=value)
+            self.draw.ellipse((x - rx, y - ry, x + rx, y + ry), fill=value)
 
-    def draw_surface(self, contours: Sequence[Tuple[str, Sequence[Point]]], polarity: str):
+    def draw_surface(self, contours: Sequence[Tuple[str, Sequence[Point]]], polarity: str) -> None:
         positive = 255 if polarity == "P" else 0
         negative = 0 if polarity == "P" else 255
         for kind, points in contours:
@@ -247,11 +249,23 @@ class RasterCanvas:
 
 
 class ODBRenderer:
-    def __init__(self, job_dir: Path, dpi: float):
+    def __init__(self, job_dir: Path, dpi: float, dpi_y: Optional[float] = None):
         self.job = job_dir
-        self.dpi = dpi
+        self.dpi_x = float(dpi)
+        self.dpi_y = float(dpi if dpi_y is None else dpi_y)
+        self.dpi = self.dpi_x
         self.stats = RenderStats()
         self.warnings: List[str] = []
+
+    @classmethod
+    def from_um_per_pixel(cls, job_dir: Path, um_per_pixel_x: float,
+                          um_per_pixel_y: Optional[float] = None) -> "ODBRenderer":
+        if um_per_pixel_x <= 0:
+            raise ValueError("um_per_pixel_x must be > 0")
+        uy = um_per_pixel_x if um_per_pixel_y is None else um_per_pixel_y
+        if uy <= 0:
+            raise ValueError("um_per_pixel_y must be > 0")
+        return cls(job_dir, 25400.0 / um_per_pixel_x, 25400.0 / uy)
 
     def _step_dir(self, step: str) -> Path:
         path = self.job / "steps" / step.lower()
@@ -259,12 +273,12 @@ class ODBRenderer:
             raise ODBError(f"Step not found: {step}")
         return path
 
-    def _warn(self, text: str):
+    def _warn(self, text: str) -> None:
         self.stats.unsupported += 1
         if len(self.warnings) < 50:
             self.warnings.append(text)
 
-    def _render_feature_file(self, canvas: RasterCanvas, feature_file: Path, transform: Transform):
+    def _render_feature_file(self, canvas: RasterCanvas, feature_file: Path, transform: Transform) -> None:
         if not feature_file.exists():
             return
         symbols = parse_symbol_table(feature_file)
@@ -300,7 +314,8 @@ class ODBRenderer:
                     if diameter is None:
                         self._warn(f"Unsupported L symbol {symbols.get(symbol_id)!r}")
                         continue
-                    canvas.draw_round_line(transform.apply((x1, y1)), transform.apply((x2, y2)), diameter, 255 if polarity == "P" else 0)
+                    canvas.draw_round_line(transform.apply((x1, y1)), transform.apply((x2, y2)), diameter,
+                                           255 if polarity == "P" else 0)
                     self.stats.lines += 1
                 elif command == "S" and len(tokens) >= 2:
                     polarity = tokens[1].upper()
@@ -320,8 +335,8 @@ class ODBRenderer:
                         elif cmd == "OS" and current is not None:
                             current.append((float(values[1]), float(values[2])))
                         elif cmd == "OC" and current is not None and len(values) >= 6:
-                            end = (float(values[1]), float(values[2]))
-                            center = (float(values[3]), float(values[4]))
+                            end = float(values[1]), float(values[2])
+                            center = float(values[3]), float(values[4])
                             current.extend(arc_points(current[-1], end, center, values[5].upper().startswith("Y")))
                         elif cmd == "OE":
                             if current:
@@ -338,7 +353,8 @@ class ODBRenderer:
             except (ValueError, IndexError) as exc:
                 self._warn(f"Parse error: {record[:100]} ({exc})")
 
-    def _render_step_recursive(self, canvas: RasterCanvas, step: str, layer: str, parent_transform: Transform, depth: int = 0):
+    def _render_step_recursive(self, canvas: RasterCanvas, step: str, layer: str,
+                               parent_transform: Transform, depth: int = 0) -> None:
         if depth > 8:
             raise ODBError("STEP-REPEAT recursion too deep")
         step_dir = self._step_dir(step)
@@ -354,7 +370,8 @@ class ODBRenderer:
 
     def render(self, step: str, layer: str, margin_px: int = 0) -> Image.Image:
         profile = self._step_dir(step) / "profile"
-        canvas = RasterCanvas(contours_bounds(parse_profile_contours(profile)), self.dpi, margin_px=margin_px, background=0)
+        canvas = RasterCanvas(contours_bounds(parse_profile_contours(profile)), self.dpi_x, self.dpi_y,
+                              margin_px=margin_px, background=0)
         self._render_step_recursive(canvas, step.lower(), layer.lower(), Transform())
         return canvas.image
 
@@ -406,12 +423,21 @@ def main() -> int:
     parser.add_argument("--step", default="unit")
     parser.add_argument("--layer", default="l1")
     parser.add_argument("--dpi", type=float, default=1200.0)
+    parser.add_argument("--um-per-pixel-x", type=float)
+    parser.add_argument("--um-per-pixel-y", type=float)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--invert", action="store_true")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
+
     if args.dpi <= 0 or args.dpi > 10000:
         parser.error("--dpi must be > 0 and <= 10000")
+    if args.um_per_pixel_x is not None and args.um_per_pixel_x <= 0:
+        parser.error("--um-per-pixel-x must be > 0")
+    if args.um_per_pixel_y is not None and args.um_per_pixel_y <= 0:
+        parser.error("--um-per-pixel-y must be > 0")
+    if args.um_per_pixel_y is not None and args.um_per_pixel_x is None:
+        parser.error("--um-per-pixel-y requires --um-per-pixel-x")
 
     job, temp_dir = extract_input(args.input)
     try:
@@ -419,15 +445,23 @@ def main() -> int:
             print(f"Job: {job.name}")
             print(list_job(job))
             return 0
-        output = args.output or Path(f"{job.name}_{args.step}_{args.layer}_{int(args.dpi)}dpi.png")
-        renderer = ODBRenderer(job, args.dpi)
+        if args.um_per_pixel_x is not None:
+            uy = args.um_per_pixel_x if args.um_per_pixel_y is None else args.um_per_pixel_y
+            renderer = ODBRenderer.from_um_per_pixel(job, args.um_per_pixel_x, uy)
+            suffix = f"{args.um_per_pixel_x:g}x{uy:g}umpp"
+            description = f"AOI X={args.um_per_pixel_x:g}, Y={uy:g} um/pixel"
+        else:
+            renderer = ODBRenderer(job, args.dpi)
+            suffix = f"{int(args.dpi)}dpi"
+            description = f"{args.dpi:g} DPI"
+        output = args.output or Path(f"{job.name}_{args.step}_{args.layer}_{suffix}.png")
         image = renderer.render(args.step, args.layer)
         if args.invert:
             image = image.point(lambda value: 255 - value)
         output.parent.mkdir(parents=True, exist_ok=True)
-        image.save(output, optimize=True)
+        image.save(output, optimize=True, dpi=(renderer.dpi_x, renderer.dpi_y))
         print(f"Saved: {output}")
-        print(f"Image: {image.width} x {image.height} px @ {args.dpi:g} DPI")
+        print(f"Image: {image.width} x {image.height} px | {description}")
         stats = renderer.stats
         print(f"Rendered: pads={stats.pads}, lines={stats.lines}, surfaces={stats.surfaces}, repeats={stats.repeats}")
         print(f"Unsupported/parse warnings: {stats.unsupported}")
