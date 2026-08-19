@@ -38,3 +38,43 @@ def test_um_per_pixel_conversion():
     renderer = ODBRenderer.from_um_per_pixel(Path("."), 10.0, 5.0)
     assert renderer.dpi_x == 2540.0
     assert renderer.dpi_y == 5080.0
+
+
+def test_composite_gv_operations(monkeypatch):
+    from PIL import Image
+    from odb_cam_renderer import CompositeLayer
+
+    masks = {
+        "base": Image.new("L", (4, 1), 0),
+        "via": Image.new("L", (4, 1), 0),
+        "hole": Image.new("L", (4, 1), 0),
+    }
+    masks["base"].putdata([255, 255, 255, 0])
+    masks["via"].putdata([0, 255, 0, 255])
+    masks["hole"].putdata([0, 0, 255, 0])
+
+    renderer = ODBRenderer(Path("."), 100.0)
+    monkeypatch.setattr(renderer, "render", lambda _step, layer, margin_px=0: masks[layer].copy())
+    image = renderer.render_composite(
+        "unit",
+        [
+            CompositeLayer("base", "REPLACE", 255),
+            CompositeLayer("via", "REPLACE", 160),
+            CompositeLayer("hole", "SUBTRACT", 80),
+        ],
+    )
+    assert list(image.getdata()) == [255, 160, 0, 160]
+
+
+def test_composite_add_uses_maximum(monkeypatch):
+    from PIL import Image
+    from odb_cam_renderer import CompositeLayer
+
+    mask = Image.new("L", (2, 1), 255)
+    renderer = ODBRenderer(Path("."), 100.0)
+    monkeypatch.setattr(renderer, "render", lambda _step, _layer, margin_px=0: mask.copy())
+    image = renderer.render_composite(
+        "unit",
+        [CompositeLayer("a", "REPLACE", 200), CompositeLayer("b", "ADD", 120)],
+    )
+    assert list(image.getdata()) == [200, 200]
