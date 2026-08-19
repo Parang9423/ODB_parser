@@ -1,6 +1,8 @@
 from pathlib import Path
 
 from odb_cam_renderer import (
+    ODBRenderer,
+    RasterCanvas,
     contours_bounds,
     parse_profile_contours,
     parse_standard_symbol,
@@ -25,3 +27,14 @@ def test_profile_bounds(tmp_path: Path):
 def test_repeat_translation():
     transform = repeat_transform(2.0, 3.0, 0.0, False)
     assert transform.apply((1.0, 1.0)) == (3.0, 4.0)
+
+
+def test_anisotropic_raster_canvas_size():
+    canvas = RasterCanvas((0.0, 0.0, 1.0, 1.0), 100.0, 200.0)
+    assert canvas.image.size == (100, 200)
+
+
+def test_um_per_pixel_conversion():
+    renderer = ODBRenderer.from_um_per_pixel(Path("."), 10.0, 5.0)
+    assert renderer.dpi_x == 2540.0
+    assert renderer.dpi_y == 5080.0
