@@ -1,510 +1,227 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import queue
-import threading
-import tkinter as tk
+import json, math, queue, threading, tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from typing import List, Optional
-
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from typing import Dict, List, Optional
 from PIL import Image, ImageOps, ImageTk
+from odb_cam_renderer import ODBError, ODBRenderer, contours_bounds, extract_input, parse_kv_blocks, parse_profile_contours
 
-from odb_cam_renderer import (
-    ODBError,
-    ODBRenderer,
-    contours_bounds,
-    extract_input,
-    parse_kv_blocks,
-    parse_profile_contours,
-)
-
-DEFAULT_PREVIEW_DPI = 600
-DEFAULT_RENDER_DPI = 1200
-MIN_DPI = 72
-MAX_DPI = 10000
-MIN_ZOOM = 0.05
-MAX_ZOOM = 16.0
-ZOOM_STEP = 1.25
-
+PREVIEW_DPI_DEFAULT=600; OUTPUT_DPI_DEFAULT=1200; MIN_DPI=72; MAX_DPI=10000
+MIN_UM=0.1; MAX_UM=1000.0; ZOOM_MIN=.05; ZOOM_MAX=16.; ZOOM_STEP=1.25
+MODE_DPI="DPI"; MODE_AOI="AOI 해상도"; CUSTOM="사용자 지정"
+PROFILE_FILE=Path.home()/".odb_cam_renderer"/"aoi_profiles.json"
 
 @dataclass(frozen=True)
 class LayerInfo:
-    name: str
-    layer_type: str = "?"
-    context: str = "?"
-    side: str = "?"
-    polarity: str = "?"
-
+    name:str; layer_type:str="?"; context:str="?"; side:str="?"; polarity:str="?"
     @property
-    def label(self) -> str:
-        details = [self.layer_type]
-        if self.side not in {"", "?"}:
-            details.append(self.side)
-        return f"{self.name}  [{' / '.join(details)}]"
-
+    def label(self):
+        return f"{self.name}  [{self.layer_type}{' / '+self.side if self.side not in {'','?'} else ''}]"
 
 @dataclass
 class JobInfo:
-    name: str
-    steps: List[str]
-    layers: List[LayerInfo]
+    name:str; steps:List[str]; layers:List[LayerInfo]
 
 
-def inspect_job(job_dir: Path) -> JobInfo:
-    steps_dir = job_dir / "steps"
-    if not steps_dir.is_dir():
-        raise ODBError("ODB++ steps directory is missing")
-    steps = sorted(p.name for p in steps_dir.iterdir() if p.is_dir())
-    layers: List[LayerInfo] = []
-    matrix = job_dir / "matrix" / "matrix"
+def inspect_job(job:Path)->JobInfo:
+    steps_dir=job/"steps"
+    if not steps_dir.is_dir(): raise ODBError("ODB++ steps directory is missing")
+    steps=sorted(p.name for p in steps_dir.iterdir() if p.is_dir()); layers=[]
+    matrix=job/"matrix"/"matrix"
     if matrix.exists():
-        for block in parse_kv_blocks(matrix, "LAYER"):
-            name = block.get("NAME")
-            if name:
-                layers.append(LayerInfo(
-                    name=name,
-                    layer_type=block.get("TYPE", "?"),
-                    context=block.get("CONTEXT", "?"),
-                    side=block.get("SIDE", "?"),
-                    polarity=block.get("POLARITY", "?"),
-                ))
-    return JobInfo(name=job_dir.name, steps=steps, layers=layers)
+        for b in parse_kv_blocks(matrix,"LAYER"):
+            if b.get("NAME"):
+                layers.append(LayerInfo(b["NAME"],b.get("TYPE","?"),b.get("CONTEXT","?"),b.get("SIDE","?"),b.get("POLARITY","?")))
+    return JobInfo(job.name,steps,layers)
 
 
-def render_layer(job_dir: Path, step: str, layer: str, dpi: int) -> tuple[Image.Image, ODBRenderer]:
-    renderer = ODBRenderer(job_dir, dpi)
-    return renderer.render(step, layer), renderer
+def profile_size_mm(job:Path,step:str):
+    b=contours_bounds(parse_profile_contours(job/"steps"/step.lower()/"profile"))
+    return (b[2]-b[0])*25.4,(b[3]-b[1])*25.4
 
 
-def profile_size_mm(job_dir: Path, step: str) -> tuple[float, float]:
-    contours = parse_profile_contours(job_dir / "steps" / step.lower() / "profile")
-    xmin, ymin, xmax, ymax = contours_bounds(contours)
-    return (xmax - xmin) * 25.4, (ymax - ymin) * 25.4
+def load_profiles()->Dict[str,dict]:
+    try: return json.loads(PROFILE_FILE.read_text(encoding="utf-8")) if PROFILE_FILE.exists() else {}
+    except Exception: return {}
 
 
-class ODBCamApp(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("ODB++ CAM Image Renderer")
-        self.geometry("1320x820")
-        self.minsize(1050, 680)
+def save_profiles(data:Dict[str,dict]):
+    PROFILE_FILE.parent.mkdir(parents=True,exist_ok=True)
+    PROFILE_FILE.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding="utf-8")
 
-        self.job_dir: Optional[Path] = None
-        self.job_tmp = None
-        self.job_info: Optional[JobInfo] = None
-        self.source_file: Optional[Path] = None
-        self.preview_photo: Optional[ImageTk.PhotoImage] = None
-        self.preview_image: Optional[Image.Image] = None
-        self.preview_zoom = 1.0
-        self.preview_offset_x = 0.0
-        self.preview_offset_y = 0.0
-        self.preview_dpi = DEFAULT_PREVIEW_DPI
-        self._pan_start: Optional[tuple[int, int]] = None
-        self._preview_token = 0
-        self._result_queue: queue.Queue = queue.Queue()
 
-        self.step_var = tk.StringVar()
-        self.layer_var = tk.StringVar()
-        self.dpi_var = tk.IntVar(value=DEFAULT_RENDER_DPI)
-        self.zoom_var = tk.StringVar(value="100%")
-        self.status_var = tk.StringVar(value="ODB++ TGZ 파일을 열어주세요.")
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__(); self.title("ODB++ CAM Image Renderer"); self.geometry("1380x850"); self.minsize(1120,700)
+        self.job=None; self.tmp=None; self.info=None; self.source=None; self.preview=None; self.photo=None
+        self.zoom=1.; self.offx=self.offy=0.; self.pan=None; self.preview_dpi=PREVIEW_DPI_DEFAULT; self.profiles=load_profiles(); self.token=0; self.q=queue.Queue()
+        self.step=tk.StringVar(); self.layer=tk.StringVar(); self.mode=tk.StringVar(value=MODE_DPI); self.dpi=tk.IntVar(value=OUTPUT_DPI_DEFAULT)
+        self.profile=tk.StringVar(value=CUSTOM); self.umx=tk.DoubleVar(value=10.); self.umy=tk.DoubleVar(value=10.); self.lock=tk.BooleanVar(value=True)
+        self.zoom_text=tk.StringVar(value="100%"); self.status=tk.StringVar(value="ODB++ TGZ 파일을 열어주세요.")
+        self._menu(); self._ui(); self._mode_changed(); self.protocol("WM_DELETE_WINDOW",self.close); self.after(100,self.poll)
 
-        self._build_menu()
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(100, self._poll_results)
+    def _menu(self):
+        m=tk.Menu(self); f=tk.Menu(m,tearoff=False); f.add_command(label="ODB++ 파일 열기...",accelerator="Ctrl+O",command=self.open_file); f.add_separator(); f.add_command(label="종료",command=self.close); m.add_cascade(label="파일",menu=f)
+        s=tk.Menu(m,tearoff=False); s.add_command(label="미리보기 설정...",command=self.preview_settings); m.add_cascade(label="설정",menu=s); self.config(menu=m); self.bind_all("<Control-o>",lambda e:self.open_file())
 
-    def _build_menu(self) -> None:
-        menu = tk.Menu(self)
-        file_menu = tk.Menu(menu, tearoff=False)
-        file_menu.add_command(label="ODB++ 파일 열기...", accelerator="Ctrl+O", command=self.open_file)
-        file_menu.add_separator()
-        file_menu.add_command(label="종료", command=self._on_close)
-        menu.add_cascade(label="파일", menu=file_menu)
-        settings_menu = tk.Menu(menu, tearoff=False)
-        settings_menu.add_command(label="미리보기 설정...", command=self.open_settings)
-        menu.add_cascade(label="설정", menu=settings_menu)
-        self.config(menu=menu)
-        self.bind_all("<Control-o>", lambda _event: self.open_file())
+    def _ui(self):
+        root=ttk.Frame(self,padding=12); root.pack(fill="both",expand=True); top=ttk.Frame(root); top.pack(fill="x",pady=(0,10)); ttk.Button(top,text="파일 업로드",command=self.open_file).pack(side="left"); self.file_label=ttk.Label(top,text="선택된 파일 없음"); self.file_label.pack(side="left",padx=12)
+        panes=ttk.Panedwindow(root,orient="horizontal"); panes.pack(fill="both",expand=True); left=ttk.Frame(panes,padding=(4,8)); right=ttk.Frame(panes,padding=(8,8)); panes.add(left,weight=0); panes.add(right,weight=1)
+        ttk.Label(left,text="렌더링 설정",font=("TkDefaultFont",12,"bold")).grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,12))
+        ttk.Label(left,text="Step").grid(row=1,column=0,sticky="w",pady=5); self.step_cb=ttk.Combobox(left,textvariable=self.step,state="disabled",width=26); self.step_cb.grid(row=1,column=1); self.step_cb.bind("<<ComboboxSelected>>",lambda e:self.selection())
+        ttk.Label(left,text="Layer").grid(row=2,column=0,sticky="w",pady=5); self.layer_cb=ttk.Combobox(left,textvariable=self.layer,state="disabled",width=26); self.layer_cb.grid(row=2,column=1); self.layer_cb.bind("<<ComboboxSelected>>",lambda e:self.selection())
+        ttk.Label(left,text="출력 방식").grid(row=3,column=0,sticky="w",pady=5); self.mode_cb=ttk.Combobox(left,textvariable=self.mode,values=[MODE_DPI,MODE_AOI],state="readonly",width=18); self.mode_cb.grid(row=3,column=1,sticky="w"); self.mode_cb.bind("<<ComboboxSelected>>",lambda e:self._mode_changed())
+        ttk.Label(left,text="출력 DPI").grid(row=4,column=0,sticky="w",pady=5); self.dpi_sp=ttk.Spinbox(left,from_=MIN_DPI,to=MAX_DPI,increment=50,textvariable=self.dpi,width=12); self.dpi_sp.grid(row=4,column=1,sticky="w")
+        self.aoi=ttk.LabelFrame(left,text="AOI 해상도 설정",padding=8); self.aoi.grid(row=5,column=0,columnspan=2,sticky="ew",pady=(8,4))
+        ttk.Label(self.aoi,text="설비 프로파일").grid(row=0,column=0,sticky="w"); self.profile_cb=ttk.Combobox(self.aoi,textvariable=self.profile,state="readonly",width=20); self.profile_cb.grid(row=0,column=1); self.profile_cb.bind("<<ComboboxSelected>>",lambda e:self.use_profile())
+        ttk.Label(self.aoi,text="X (µm/pixel)").grid(row=1,column=0,sticky="w",pady=3); self.xsp=ttk.Spinbox(self.aoi,from_=MIN_UM,to=MAX_UM,increment=.1,textvariable=self.umx,width=12); self.xsp.grid(row=1,column=1,sticky="w")
+        ttk.Label(self.aoi,text="Y (µm/pixel)").grid(row=2,column=0,sticky="w",pady=3); self.ysp=ttk.Spinbox(self.aoi,from_=MIN_UM,to=MAX_UM,increment=.1,textvariable=self.umy,width=12); self.ysp.grid(row=2,column=1,sticky="w")
+        ttk.Checkbutton(self.aoi,text="X/Y 동일 해상도",variable=self.lock,command=self.lock_changed).grid(row=3,column=0,columnspan=2,sticky="w"); ttk.Button(self.aoi,text="현재 값 프로파일 저장",command=self.save_profile).grid(row=4,column=0,columnspan=2,sticky="ew",pady=(5,0)); self.umx.trace_add("write",lambda *_:self.sync_y()); self.refresh_profiles()
+        self.render_btn=ttk.Button(left,text="렌더링 결과 저장",command=self.render,state="disabled"); self.render_btn.grid(row=6,column=0,columnspan=2,sticky="ew",pady=(14,12)); ttk.Separator(left).grid(row=7,column=0,columnspan=2,sticky="ew")
+        ttk.Label(left,text="ODB 정보",font=("TkDefaultFont",10,"bold")).grid(row=8,column=0,columnspan=2,sticky="w",pady=(8,4)); self.info_txt=tk.Text(left,width=40,height=18,wrap="word",state="disabled",relief="flat"); self.info_txt.grid(row=9,column=0,columnspan=2,sticky="nsew"); left.rowconfigure(9,weight=1)
+        hdr=ttk.Frame(right); hdr.pack(fill="x",pady=(0,8)); ttk.Label(hdr,text="CAM 미리보기",font=("TkDefaultFont",12,"bold")).pack(side="left"); tools=ttk.Frame(hdr); tools.pack(side="right"); ttk.Button(tools,text="−",width=3,command=lambda:self.change_zoom(1/ZOOM_STEP)).pack(side="left"); ttk.Label(tools,textvariable=self.zoom_text,width=7,anchor="center").pack(side="left"); ttk.Button(tools,text="+",width=3,command=lambda:self.change_zoom(ZOOM_STEP)).pack(side="left"); ttk.Button(tools,text="맞춤",command=self.fit).pack(side="left",padx=(6,0)); ttk.Button(tools,text="100%",command=self.actual).pack(side="left",padx=(4,0))
+        cf=ttk.Frame(right); cf.pack(fill="both",expand=True); cf.rowconfigure(0,weight=1); cf.columnconfigure(0,weight=1); self.canvas=tk.Canvas(cf,background="#202020",highlightthickness=0,cursor="fleur"); self.canvas.grid(row=0,column=0,sticky="nsew"); hs=ttk.Scrollbar(cf,orient="horizontal",command=self.canvas.xview); vs=ttk.Scrollbar(cf,orient="vertical",command=self.canvas.yview); hs.grid(row=1,column=0,sticky="ew"); vs.grid(row=0,column=1,sticky="ns"); self.canvas.configure(xscrollcommand=hs.set,yscrollcommand=vs.set)
+        self.canvas.bind("<Configure>",lambda e:self.draw()); self.canvas.bind("<MouseWheel>",self.wheel); self.canvas.bind("<Button-4>",self.wheel); self.canvas.bind("<Button-5>",self.wheel); self.canvas.bind("<ButtonPress-1>",self.pan_start); self.canvas.bind("<B1-Motion>",self.pan_move); self.canvas.bind("<ButtonRelease-1>",self.pan_end); ttk.Label(root,textvariable=self.status,anchor="w",relief="sunken").pack(fill="x",pady=(10,0))
 
-    def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=12)
-        root.pack(fill="both", expand=True)
-        top = ttk.Frame(root)
-        top.pack(fill="x", pady=(0, 10))
-        ttk.Button(top, text="파일 업로드", command=self.open_file).pack(side="left")
-        self.file_label = ttk.Label(top, text="선택된 파일 없음")
-        self.file_label.pack(side="left", padx=12)
+    def refresh_profiles(self):
+        vals=[CUSTOM]+sorted(self.profiles); self.profile_cb["values"]=vals
+        if self.profile.get() not in vals:self.profile.set(CUSTOM)
+    def valid_um(self):
+        try:x,y=float(self.umx.get()),float(self.umy.get())
+        except Exception:raise ValueError("AOI 해상도는 숫자여야 합니다.")
+        if not(MIN_UM<=x<=MAX_UM and MIN_UM<=y<=MAX_UM):raise ValueError(f"AOI 해상도는 {MIN_UM}~{MAX_UM} µm/pixel 범위여야 합니다.")
+        return x,y
+    def sync_y(self):
+        if self.lock.get():
+            try:self.umy.set(self.umx.get())
+            except tk.TclError:pass
+        self.update_info()
+    def lock_changed(self):
+        if self.lock.get():self.umy.set(self.umx.get());self.ysp.configure(state="disabled")
+        elif self.mode.get()==MODE_AOI:self.ysp.configure(state="normal")
+        self.update_info()
+    def _mode_changed(self):
+        a=self.mode.get()==MODE_AOI; self.dpi_sp.configure(state="disabled" if a else "normal")
+        for w in self.aoi.winfo_children():
+            try:w.configure(state="normal" if a else "disabled")
+            except tk.TclError:pass
+        if a:self.profile_cb.configure(state="readonly");self.lock_changed()
+        self.update_info()
+    def save_profile(self):
+        try:x,y=self.valid_um()
+        except ValueError as e:return messagebox.showerror("AOI 해상도 오류",str(e))
+        name=simpledialog.askstring("설비 프로파일 저장","설비/프로파일 이름을 입력하세요.",parent=self)
+        if not name:return
+        self.profiles[name.strip()]={"um_per_pixel_x":x,"um_per_pixel_y":y};save_profiles(self.profiles);self.refresh_profiles();self.profile.set(name.strip());self.status.set(f"프로파일 저장: {name.strip()}")
+    def use_profile(self):
+        p=self.profiles.get(self.profile.get())
+        if p:self.lock.set(abs(float(p["um_per_pixel_x"])-float(p.get("um_per_pixel_y",p["um_per_pixel_x"])))<1e-12);self.umx.set(float(p["um_per_pixel_x"]));self.umy.set(float(p.get("um_per_pixel_y",p["um_per_pixel_x"])));self.lock_changed()
 
-        content = ttk.Panedwindow(root, orient="horizontal")
-        content.pack(fill="both", expand=True)
-        sidebar = ttk.Frame(content, padding=(4, 8))
-        preview_frame = ttk.Frame(content, padding=(8, 8))
-        content.add(sidebar, weight=0)
-        content.add(preview_frame, weight=1)
+    def preview_settings(self):
+        d=tk.Toplevel(self);d.title("설정");d.transient(self);d.grab_set();f=ttk.Frame(d,padding=18);f.pack();ttk.Label(f,text="미리보기 DPI").grid(row=0,column=0,padx=(0,16));v=tk.StringVar(value=str(self.preview_dpi));sp=ttk.Spinbox(f,from_=MIN_DPI,to=MAX_DPI,increment=50,textvariable=v,width=12);sp.grid(row=0,column=1)
+        def apply():
+            try:n=int(v.get());assert MIN_DPI<=n<=MAX_DPI
+            except Exception:return messagebox.showerror("DPI 오류",f"{MIN_DPI}~{MAX_DPI} 범위의 정수를 입력하세요.",parent=d)
+            changed=n!=self.preview_dpi;self.preview_dpi=n;d.destroy();self.update_info();self.schedule_preview() if changed and self.job else None
+        b=ttk.Frame(f);b.grid(row=1,column=0,columnspan=2,sticky="e",pady=(14,0));ttk.Button(b,text="취소",command=d.destroy).pack(side="right");ttk.Button(b,text="적용",command=apply).pack(side="right",padx=6)
 
-        ttk.Label(sidebar, text="렌더링 설정", font=("TkDefaultFont", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
-        ttk.Label(sidebar, text="Step").grid(row=1, column=0, sticky="w", pady=5)
-        self.step_combo = ttk.Combobox(sidebar, textvariable=self.step_var, state="disabled", width=24)
-        self.step_combo.grid(row=1, column=1, sticky="ew", pady=5)
-        self.step_combo.bind("<<ComboboxSelected>>", lambda _e: self._schedule_preview())
-        ttk.Label(sidebar, text="Layer").grid(row=2, column=0, sticky="w", pady=5)
-        self.layer_combo = ttk.Combobox(sidebar, textvariable=self.layer_var, state="disabled", width=24)
-        self.layer_combo.grid(row=2, column=1, sticky="ew", pady=5)
-        self.layer_combo.bind("<<ComboboxSelected>>", lambda _e: self._schedule_preview())
-        ttk.Label(sidebar, text="출력 DPI").grid(row=3, column=0, sticky="w", pady=5)
-        self.dpi_spin = ttk.Spinbox(sidebar, from_=MIN_DPI, to=MAX_DPI, increment=50, textvariable=self.dpi_var, width=12)
-        self.dpi_spin.grid(row=3, column=1, sticky="w", pady=5)
-        self.render_button = ttk.Button(sidebar, text="렌더링 결과 저장", command=self.render_to_file, state="disabled")
-        self.render_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 12))
-
-        ttk.Separator(sidebar).grid(row=5, column=0, columnspan=2, sticky="ew", pady=6)
-        ttk.Label(sidebar, text="ODB 정보", font=("TkDefaultFont", 10, "bold")).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 6))
-        self.info_text = tk.Text(sidebar, width=38, height=20, wrap="word", state="disabled", relief="flat")
-        self.info_text.grid(row=7, column=0, columnspan=2, sticky="nsew")
-        sidebar.rowconfigure(7, weight=1)
-        sidebar.columnconfigure(1, weight=1)
-
-        preview_header = ttk.Frame(preview_frame)
-        preview_header.pack(fill="x", pady=(0, 8))
-        ttk.Label(preview_header, text="CAM 미리보기", font=("TkDefaultFont", 12, "bold")).pack(side="left")
-        zoom_tools = ttk.Frame(preview_header)
-        zoom_tools.pack(side="right")
-        ttk.Button(zoom_tools, text="−", width=3, command=lambda: self._change_zoom(1 / ZOOM_STEP)).pack(side="left", padx=(0, 2))
-        ttk.Label(zoom_tools, textvariable=self.zoom_var, width=7, anchor="center").pack(side="left", padx=2)
-        ttk.Button(zoom_tools, text="+", width=3, command=lambda: self._change_zoom(ZOOM_STEP)).pack(side="left", padx=2)
-        ttk.Button(zoom_tools, text="맞춤", command=self._fit_preview).pack(side="left", padx=(6, 0))
-        ttk.Button(zoom_tools, text="100%", command=self._actual_size_preview).pack(side="left", padx=(4, 0))
-
-        canvas_frame = ttk.Frame(preview_frame)
-        canvas_frame.pack(fill="both", expand=True)
-        canvas_frame.rowconfigure(0, weight=1)
-        canvas_frame.columnconfigure(0, weight=1)
-        self.preview_canvas = tk.Canvas(canvas_frame, background="#202020", highlightthickness=0, cursor="fleur")
-        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
-        self.h_scroll = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.preview_canvas.xview)
-        self.v_scroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.preview_canvas.yview)
-        self.h_scroll.grid(row=1, column=0, sticky="ew")
-        self.v_scroll.grid(row=0, column=1, sticky="ns")
-        self.preview_canvas.configure(xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set)
-        self.preview_canvas.bind("<Configure>", self._on_canvas_resize)
-        self.preview_canvas.bind("<MouseWheel>", self._on_mouse_wheel)
-        self.preview_canvas.bind("<Button-4>", self._on_mouse_wheel)
-        self.preview_canvas.bind("<Button-5>", self._on_mouse_wheel)
-        self.preview_canvas.bind("<ButtonPress-1>", self._start_pan)
-        self.preview_canvas.bind("<B1-Motion>", self._pan_preview)
-        self.preview_canvas.bind("<ButtonRelease-1>", self._end_pan)
-        ttk.Label(root, textvariable=self.status_var, anchor="w", relief="sunken").pack(fill="x", pady=(10, 0))
-
-    def open_settings(self) -> None:
-        dialog = tk.Toplevel(self)
-        dialog.title("설정")
-        dialog.transient(self)
-        dialog.resizable(False, False)
-        dialog.grab_set()
-        frame = ttk.Frame(dialog, padding=18)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="미리보기 설정", font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
-        ttk.Label(frame, text="미리보기 DPI").grid(row=1, column=0, sticky="w", padx=(0, 16), pady=6)
-        preview_dpi_var = tk.StringVar(value=str(self.preview_dpi))
-        dpi_entry = ttk.Spinbox(frame, from_=MIN_DPI, to=MAX_DPI, increment=50, textvariable=preview_dpi_var, width=12)
-        dpi_entry.grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Label(frame, text="값이 높을수록 확대 시 세부 형상이 선명하지만\n미리보기 생성 시간과 메모리 사용량이 증가합니다.", foreground="#666666").grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 14))
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="e")
-
-        def apply_settings() -> None:
-            try:
-                value = int(preview_dpi_var.get())
-                if not MIN_DPI <= value <= MAX_DPI:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("DPI 오류", f"미리보기 DPI는 {MIN_DPI}~{MAX_DPI} 사이의 정수여야 합니다.", parent=dialog)
-                return
-            changed = value != self.preview_dpi
-            self.preview_dpi = value
-            dialog.destroy()
-            self._update_info()
-            if changed and self.job_dir is not None and self._selected_layer() is not None:
-                self._schedule_preview()
-            else:
-                self.status_var.set(f"미리보기 DPI 설정: {self.preview_dpi}")
-
-        ttk.Button(buttons, text="취소", command=dialog.destroy).pack(side="right")
-        ttk.Button(buttons, text="적용", command=apply_settings).pack(side="right", padx=(0, 6))
-        dialog.bind("<Return>", lambda _e: apply_settings())
-        dialog.bind("<Escape>", lambda _e: dialog.destroy())
-        dpi_entry.focus_set()
-        dpi_entry.selection_range(0, "end")
-        dialog.update_idletasks()
-        x = self.winfo_rootx() + max(0, (self.winfo_width() - dialog.winfo_width()) // 2)
-        y = self.winfo_rooty() + max(0, (self.winfo_height() - dialog.winfo_height()) // 2)
-        dialog.geometry(f"+{x}+{y}")
-
-    def open_file(self) -> None:
-        path = filedialog.askopenfilename(title="ODB++ TGZ 파일 선택", filetypes=[("ODB++ TGZ", "*.tgz"), ("Tar GZip", "*.tar.gz"), ("모든 파일", "*.*")], defaultextension=".tgz")
-        if path:
-            self._load_job(Path(path))
-
-    def _load_job(self, path: Path) -> None:
-        self.status_var.set("ODB++ 파일을 분석하는 중...")
-        self.render_button.configure(state="disabled")
-        self.step_combo.configure(state="disabled")
-        self.layer_combo.configure(state="disabled")
-        self._preview_token += 1
-        token = self._preview_token
-        def worker() -> None:
-            try:
-                job_dir, tmp = extract_input(path)
-                self._result_queue.put(("loaded", token, path, job_dir, tmp, inspect_job(job_dir)))
-            except Exception as exc:
-                self._result_queue.put(("error", token, f"파일 로드 실패: {exc}"))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _apply_loaded_job(self, path: Path, job_dir: Path, tmp, info: JobInfo) -> None:
-        if self.job_tmp is not None:
-            self.job_tmp.cleanup()
-        self.job_dir, self.job_tmp, self.job_info, self.source_file = job_dir, tmp, info, path
-        self.file_label.configure(text=path.name)
-        self.step_combo["values"] = info.steps
-        self.step_var.set(self._preferred_step(info.steps))
-        self.step_combo.configure(state="readonly")
-        labels = [layer.label for layer in info.layers]
-        self.layer_combo["values"] = labels
-        if labels:
-            self.layer_combo.current(self._preferred_layer_index(info.layers))
-        self.layer_combo.configure(state="readonly" if labels else "disabled")
-        self.render_button.configure(state="normal" if labels else "disabled")
-        self.status_var.set(f"로드 완료: {info.name} / {len(info.steps)} steps / {len(info.layers)} layers")
-        self._update_info()
-        if labels:
-            self._schedule_preview()
-
-    @staticmethod
-    def _preferred_step(steps: List[str]) -> str:
-        for candidate in ("unit", "strip", "pnl"):
-            if candidate in steps:
-                return candidate
-        return steps[0] if steps else ""
-
-    @staticmethod
-    def _preferred_layer_index(layers: List[LayerInfo]) -> int:
-        for i, layer in enumerate(layers):
-            if layer.name.lower() == "l1":
-                return i
-        for i, layer in enumerate(layers):
-            if layer.layer_type.upper() == "SIGNAL":
-                return i
-        return 0
-
-    def _selected_layer(self) -> Optional[LayerInfo]:
-        if not self.job_info:
-            return None
-        return next((layer for layer in self.job_info.layers if layer.label == self.layer_var.get()), None)
-
-    def _schedule_preview(self) -> None:
-        if self.job_dir is None:
-            return
-        layer, step = self._selected_layer(), self.step_var.get()
-        if layer is None or not step:
-            return
-        self._preview_token += 1
-        token = self._preview_token
-        preview_dpi = self.preview_dpi
-        self.status_var.set(f"미리보기 생성 중: {step}/{layer.name} @ {preview_dpi} DPI")
-        self.render_button.configure(state="disabled")
-        job_dir = self.job_dir
-        def worker() -> None:
-            try:
-                image, renderer = render_layer(job_dir, step, layer.name, preview_dpi)
-                self._result_queue.put(("preview", token, image, renderer.stats, preview_dpi))
-            except Exception as exc:
-                self._result_queue.put(("error", token, f"미리보기 생성 실패: {exc}"))
-        threading.Thread(target=worker, daemon=True).start()
-        self._update_info()
-
-    def _poll_results(self) -> None:
+    def open_file(self):
+        p=filedialog.askopenfilename(title="ODB++ TGZ 파일 선택",filetypes=[("ODB++ TGZ","*.tgz"),("Tar GZip","*.tar.gz"),("모든 파일","*.*")],defaultextension=".tgz")
+        if p:self.load(Path(p))
+    def load(self,path:Path):
+        self.status.set("ODB++ 파일을 분석하는 중...");self.token+=1;t=self.token
+        def work():
+            try:j,tmp=extract_input(path);self.q.put(("loaded",t,path,j,tmp,inspect_job(j)))
+            except Exception as e:self.q.put(("error",t,f"파일 로드 실패: {e}"))
+        threading.Thread(target=work,daemon=True).start()
+    def apply_loaded(self,path,j,tmp,info):
+        if self.tmp:self.tmp.cleanup()
+        self.job,self.tmp,self.info,self.source=j,tmp,info,path;self.file_label.configure(text=path.name);self.step_cb["values"]=info.steps;self.step.set("unit" if "unit" in info.steps else info.steps[0]);self.step_cb.configure(state="readonly")
+        labels=[x.label for x in info.layers];self.layer_cb["values"]=labels;idx=next((i for i,x in enumerate(info.layers) if x.name.lower()=="l1"),0);self.layer_cb.current(idx);self.layer_cb.configure(state="readonly");self.render_btn.configure(state="normal");self.update_info();self.schedule_preview()
+    def selected_layer(self):return next((x for x in self.info.layers if x.label==self.layer.get()),None) if self.info else None
+    def selection(self):self.update_info();self.schedule_preview()
+    def schedule_preview(self):
+        if not self.job:return
+        l=self.selected_layer();s=self.step.get()
+        if not l or not s:return
+        self.token+=1;t=self.token;dpi=self.preview_dpi;self.render_btn.configure(state="disabled");self.status.set(f"미리보기 생성 중: {s}/{l.name} @ {dpi} DPI")
+        def work():
+            try:r=ODBRenderer(self.job,dpi);im=r.render(s,l.name);self.q.put(("preview",t,im,r.stats,dpi))
+            except Exception as e:self.q.put(("error",t,f"미리보기 생성 실패: {e}"))
+        threading.Thread(target=work,daemon=True).start()
+    def poll(self):
         try:
             while True:
-                result = self._result_queue.get_nowait()
-                kind = result[0]
-                if kind == "loaded":
-                    _, token, path, job_dir, tmp, info = result
-                    if token == self._preview_token:
-                        self._apply_loaded_job(path, job_dir, tmp, info)
-                    elif tmp is not None:
-                        tmp.cleanup()
-                elif kind == "preview":
-                    _, token, image, stats, preview_dpi = result
-                    if token == self._preview_token:
-                        self.preview_image = image
-                        self.after_idle(self._fit_preview)
-                        self.render_button.configure(state="normal")
-                        self.status_var.set(f"미리보기 완료 | {image.width}×{image.height}px @ {preview_dpi} DPI | pads={stats.pads}, lines={stats.lines}, surfaces={stats.surfaces}, warnings={stats.unsupported}")
-                elif kind == "rendered":
-                    _, image, output, stats = result
-                    self.render_button.configure(state="normal")
-                    self.status_var.set(f"렌더링 완료: {output}")
-                    messagebox.showinfo("렌더링 완료", f"결과 파일을 저장했습니다.\n\n{output}\n\n크기: {image.width} × {image.height} px\nPads: {stats.pads}, Lines: {stats.lines}, Surfaces: {stats.surfaces}\nWarnings: {stats.unsupported}")
-                elif kind == "error":
-                    _, token, msg = result
-                    if token != self._preview_token:
-                        continue
-                    self.render_button.configure(state="normal" if self.job_dir else "disabled")
-                    self.status_var.set(msg)
-                    messagebox.showerror("오류", msg)
-        except queue.Empty:
-            pass
-        finally:
-            self.after(100, self._poll_results)
+                r=self.q.get_nowait();k=r[0]
+                if k=="loaded":
+                    _,t,p,j,tmp,info=r
+                    if t==self.token:self.apply_loaded(p,j,tmp,info)
+                    elif tmp:tmp.cleanup()
+                elif k=="preview":
+                    _,t,im,st,dpi=r
+                    if t==self.token:self.preview=im;self.fit();self.render_btn.configure(state="normal");self.status.set(f"미리보기 완료 | {im.width}×{im.height}px @ {dpi} DPI | warnings={st.unsupported}")
+                elif k=="rendered":
+                    _,im,out,st,desc=r;self.render_btn.configure(state="normal");self.status.set(f"렌더링 완료: {out}");messagebox.showinfo("렌더링 완료",f"{out}\n\n{desc}\n크기: {im.width} × {im.height}px\nWarnings: {st.unsupported}")
+                elif k=="error":
+                    _,t,msg=r
+                    if t==self.token:self.render_btn.configure(state="normal" if self.job else "disabled");self.status.set(msg);messagebox.showerror("오류",msg)
+        except queue.Empty:pass
+        self.after(100,self.poll)
 
-    def _on_canvas_resize(self, _event=None) -> None:
-        if self.preview_image is not None and self.preview_photo is None:
-            self._fit_preview()
-        else:
-            self._draw_preview()
+    def fit(self):
+        if not self.preview:return self.draw()
+        self.zoom=max(ZOOM_MIN,min(ZOOM_MAX,min(max(1,self.canvas.winfo_width()-32)/self.preview.width,max(1,self.canvas.winfo_height()-32)/self.preview.height)));self.offx=self.offy=0.;self.draw()
+    def actual(self):self.zoom=1.;self.offx=self.offy=0.;self.draw()
+    def change_zoom(self,f,x=None,y=None):
+        if not self.preview:return
+        old=self.zoom;new=max(ZOOM_MIN,min(ZOOM_MAX,old*f));cw,ch=max(1,self.canvas.winfo_width()),max(1,self.canvas.winfo_height());ax=cw/2 if x is None else x;ay=ch/2 if y is None else y;ix=(ax-cw/2-self.offx)/old;iy=(ay-ch/2-self.offy)/old;self.zoom=new;self.offx=ax-cw/2-ix*new;self.offy=ay-ch/2-iy*new;self.draw()
+    def wheel(self,e):self.change_zoom(ZOOM_STEP if getattr(e,"num",None)==4 or getattr(e,"delta",0)>0 else 1/ZOOM_STEP,e.x,e.y);return "break"
+    def pan_start(self,e):self.pan=(e.x,e.y)
+    def pan_move(self,e):
+        if not self.pan:return
+        x,y=self.pan;self.offx+=e.x-x;self.offy+=e.y-y;self.pan=(e.x,e.y);self.draw()
+    def pan_end(self,e):self.pan=None
+    def draw(self):
+        self.canvas.delete("all")
+        if not self.preview:return self.canvas.create_text(max(10,self.canvas.winfo_width()//2),max(10,self.canvas.winfo_height()//2),text="ODB++ 파일을 열고 Layer를 선택하면 미리보기가 표시됩니다.",fill="white")
+        w=max(1,round(self.preview.width*self.zoom));h=max(1,round(self.preview.height*self.zoom));rs=Image.Resampling.NEAREST if self.zoom>=1 else Image.Resampling.LANCZOS;im=self.preview.resize((w,h),rs);self.photo=ImageTk.PhotoImage(ImageOps.colorize(im,black="black",white="white"));cw,ch=max(1,self.canvas.winfo_width()),max(1,self.canvas.winfo_height());self.canvas.create_image(cw/2+self.offx,ch/2+self.offy,image=self.photo,anchor="center",tags="p");b=self.canvas.bbox("p");self.canvas.configure(scrollregion=(min(0,b[0]-100),min(0,b[1]-100),max(cw,b[2]+100),max(ch,b[3]+100)));self.zoom_text.set(f"{self.zoom*100:.0f}%")
 
-    def _fit_preview(self) -> None:
-        if self.preview_image is None:
-            self._draw_preview()
-            return
-        cw = max(1, self.preview_canvas.winfo_width() - 32)
-        ch = max(1, self.preview_canvas.winfo_height() - 32)
-        self.preview_zoom = max(MIN_ZOOM, min(MAX_ZOOM, min(cw / self.preview_image.width, ch / self.preview_image.height)))
-        self.preview_offset_x = self.preview_offset_y = 0.0
-        self._draw_preview()
+    def update_info(self):
+        if not hasattr(self,"info_txt") or not self.job or not self.info:return
+        l=self.selected_layer();s=self.step.get();lines=[f"Job: {self.info.name}",f"Source: {self.source.name}",f"Step: {s}"];wh=None
+        try:wh=profile_size_mm(self.job,s);lines.append(f"Profile: {wh[0]:.3f} × {wh[1]:.3f} mm")
+        except Exception:pass
+        if l:
+            lines += ["",f"Layer: {l.name}",f"Type: {l.layer_type}",f"Side: {l.side}","",f"Preview DPI: {self.preview_dpi}",f"Output Mode: {self.mode.get()}"]
+            if self.mode.get()==MODE_DPI:lines.append(f"Output DPI: {self.dpi.get()}")
+            else:
+                try:x,y=self.valid_um();lines += [f"AOI X: {x:g} µm/pixel",f"AOI Y: {y:g} µm/pixel",f"Equivalent DPI: X={25400/x:.2f}, Y={25400/y:.2f}"];lines.append(f"Expected pixels: ≈ {math.ceil(wh[0]*1000/x)} × {math.ceil(wh[1]*1000/y)}") if wh else None
+                except ValueError:lines.append("AOI resolution: invalid")
+        self.info_txt.configure(state="normal");self.info_txt.delete("1.0","end");self.info_txt.insert("1.0","\n".join(lines));self.info_txt.configure(state="disabled")
 
-    def _actual_size_preview(self) -> None:
-        if self.preview_image is None:
-            return
-        self.preview_zoom = 1.0
-        self.preview_offset_x = self.preview_offset_y = 0.0
-        self._draw_preview()
-
-    def _change_zoom(self, factor: float, anchor_x: Optional[float] = None, anchor_y: Optional[float] = None) -> None:
-        if self.preview_image is None:
-            return
-        old_zoom = self.preview_zoom
-        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, old_zoom * factor))
-        if abs(new_zoom - old_zoom) < 1e-9:
-            return
-        cw, ch = max(1, self.preview_canvas.winfo_width()), max(1, self.preview_canvas.winfo_height())
-        ax, ay = (cw / 2 if anchor_x is None else anchor_x), (ch / 2 if anchor_y is None else anchor_y)
-        image_x = (ax - cw / 2 - self.preview_offset_x) / old_zoom
-        image_y = (ay - ch / 2 - self.preview_offset_y) / old_zoom
-        self.preview_zoom = new_zoom
-        self.preview_offset_x = ax - cw / 2 - image_x * new_zoom
-        self.preview_offset_y = ay - ch / 2 - image_y * new_zoom
-        self._draw_preview()
-
-    def _on_mouse_wheel(self, event) -> str:
-        if self.preview_image is None:
-            return "break"
-        factor = ZOOM_STEP if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else 1 / ZOOM_STEP
-        self._change_zoom(factor, event.x, event.y)
-        return "break"
-
-    def _start_pan(self, event) -> None:
-        if self.preview_image is not None:
-            self._pan_start = (event.x, event.y)
-            self.preview_canvas.configure(cursor="hand2")
-
-    def _pan_preview(self, event) -> None:
-        if self._pan_start is None or self.preview_image is None:
-            return
-        x0, y0 = self._pan_start
-        self.preview_offset_x += event.x - x0
-        self.preview_offset_y += event.y - y0
-        self._pan_start = (event.x, event.y)
-        self._draw_preview()
-
-    def _end_pan(self, _event) -> None:
-        self._pan_start = None
-        self.preview_canvas.configure(cursor="fleur")
-
-    def _draw_preview(self) -> None:
-        self.preview_canvas.delete("all")
-        if self.preview_image is None:
-            self.preview_photo = None
-            self.zoom_var.set("100%")
-            self.preview_canvas.create_text(max(10, self.preview_canvas.winfo_width() // 2), max(10, self.preview_canvas.winfo_height() // 2), text="ODB++ 파일을 열고 Layer를 선택하면 미리보기가 표시됩니다.", fill="white")
-            return
-        width = max(1, int(round(self.preview_image.width * self.preview_zoom)))
-        height = max(1, int(round(self.preview_image.height * self.preview_zoom)))
-        resample = Image.Resampling.NEAREST if self.preview_zoom >= 1.0 else Image.Resampling.LANCZOS
-        image = self.preview_image.resize((width, height), resample=resample)
-        self.preview_photo = ImageTk.PhotoImage(ImageOps.colorize(image, black="black", white="white"))
-        cw, ch = max(1, self.preview_canvas.winfo_width()), max(1, self.preview_canvas.winfo_height())
-        cx, cy = cw / 2 + self.preview_offset_x, ch / 2 + self.preview_offset_y
-        self.preview_canvas.create_image(cx, cy, image=self.preview_photo, anchor="center", tags=("preview",))
-        bbox = self.preview_canvas.bbox("preview")
-        if bbox:
-            margin = 100
-            self.preview_canvas.configure(scrollregion=(min(0, bbox[0] - margin), min(0, bbox[1] - margin), max(cw, bbox[2] + margin), max(ch, bbox[3] + margin)))
-        self.zoom_var.set(f"{self.preview_zoom * 100:.0f}%")
-
-    def _update_info(self) -> None:
-        if not self.job_dir or not self.job_info:
-            return
-        layer, step = self._selected_layer(), self.step_var.get()
-        lines = [f"Job: {self.job_info.name}", f"Source: {self.source_file.name if self.source_file else '-'}", f"Step: {step or '-'}"]
-        if step:
-            try:
-                width_mm, height_mm = profile_size_mm(self.job_dir, step)
-                lines.append(f"Profile: {width_mm:.3f} × {height_mm:.3f} mm")
-            except Exception:
-                pass
-        if layer:
-            lines.extend(["", f"Layer: {layer.name}", f"Type: {layer.layer_type}", f"Context: {layer.context}", f"Side: {layer.side}", f"Polarity: {layer.polarity}", "", f"Preview DPI: {self.preview_dpi}", f"Output DPI: {self.dpi_var.get()}", "", "Preview controls:", "Mouse wheel: Zoom", "Left drag: Pan", "맞춤: Fit to window", "100%: Actual preview pixels"])
-        self.info_text.configure(state="normal")
-        self.info_text.delete("1.0", "end")
-        self.info_text.insert("1.0", "\n".join(lines))
-        self.info_text.configure(state="disabled")
-
-    def render_to_file(self) -> None:
-        if self.job_dir is None:
-            return
-        layer, step = self._selected_layer(), self.step_var.get()
-        if layer is None or not step:
-            messagebox.showwarning("선택 필요", "렌더링할 Step과 Layer를 선택해주세요.")
-            return
+    def render(self):
+        if not self.job:return
+        l=self.selected_layer();s=self.step.get()
+        if not l:return
         try:
-            dpi = int(self.dpi_var.get())
-            if not MIN_DPI <= dpi <= MAX_DPI:
-                raise ValueError
-        except Exception:
-            messagebox.showerror("DPI 오류", f"DPI는 {MIN_DPI}~{MAX_DPI} 사이의 정수여야 합니다.")
-            return
-        default_name = f"{self.job_info.name}_{step}_{layer.name}_{dpi}dpi.png" if self.job_info else "cam.png"
-        output = filedialog.asksaveasfilename(title="CAM Image 저장", defaultextension=".png", initialfile=default_name, filetypes=[("PNG Image", "*.png")])
-        if not output:
-            return
-        output_path, job_dir = Path(output), self.job_dir
-        self.render_button.configure(state="disabled")
-        self.status_var.set(f"렌더링 중: {step}/{layer.name} @ {dpi} DPI")
-        def worker() -> None:
+            if self.mode.get()==MODE_DPI:
+                dpi=int(self.dpi.get());assert MIN_DPI<=dpi<=MAX_DPI;args=("dpi",dpi,dpi);suffix=f"{dpi}dpi";desc=f"DPI: {dpi}"
+            else:
+                x,y=self.valid_um();args=("aoi",x,y);suffix=f"{x:g}x{y:g}umpp".replace(".","p");desc=f"AOI 해상도: X={x:g}, Y={y:g} µm/pixel"
+        except Exception as e:return messagebox.showerror("출력 설정 오류",str(e) or "출력 설정값을 확인하세요.")
+        out=filedialog.asksaveasfilename(title="CAM Image 저장",defaultextension=".png",initialfile=f"{self.info.name}_{s}_{l.name}_{suffix}.png",filetypes=[("PNG Image","*.png")])
+        if not out:return
+        out=Path(out);t=self.token;self.render_btn.configure(state="disabled");self.status.set(f"렌더링 중: {s}/{l.name} | {desc}")
+        def work():
             try:
-                image, renderer = render_layer(job_dir, step, layer.name, dpi)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                image.save(output_path, optimize=True, dpi=(dpi, dpi))
-                self._result_queue.put(("rendered", image, output_path, renderer.stats))
-            except Exception as exc:
-                self._result_queue.put(("error", self._preview_token, f"렌더링 실패: {exc}"))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_close(self) -> None:
-        if self.job_tmp is not None:
-            self.job_tmp.cleanup()
+                r=ODBRenderer(self.job,args[1]) if args[0]=="dpi" else ODBRenderer.from_um_per_pixel(self.job,args[1],args[2]);im=r.render(s,l.name);out.parent.mkdir(parents=True,exist_ok=True);im.save(out,optimize=True,dpi=(r.dpi_x,r.dpi_y));self.q.put(("rendered",im,out,r.stats,desc))
+            except Exception as e:self.q.put(("error",t,f"렌더링 실패: {e}"))
+        threading.Thread(target=work,daemon=True).start()
+    def close(self):
+        if self.tmp:self.tmp.cleanup()
         self.destroy()
 
-
-def main() -> int:
-    app = ODBCamApp()
-    app.mainloop()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=="__main__":App().mainloop()
