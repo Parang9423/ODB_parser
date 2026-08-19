@@ -28,9 +28,8 @@ class App(_CoreApp):
         add_button.configure(text="+ 레이어 추가", command=self.add_composite_row)
         add_button.grid_configure(sticky="ew")
 
-        # 수정 버튼을 독립된 열에 배치하고 Composite 목록 폭도 함께 확장한다.
+        # 수정 버튼을 독립된 열에 배치하고 Composite 목록 폭만 확장한다.
         self.comp_tree.grid_configure(columnspan=5)
-        self.comp_preset_cb.grid_configure(columnspan=3)
         ttk.Button(
             self.comp_frame,
             text="선택 레이어 수정",
