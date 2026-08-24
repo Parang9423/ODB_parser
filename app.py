@@ -9,14 +9,9 @@ import app_core as core
 from app_core import App as _CoreApp
 from hierarchy_renderer import FastODBRenderer, adaptive_preview_dpi
 
-# Keep the existing app behavior, but use the cached renderer for normal/final renders too.
 core.ODBRenderer = FastODBRenderer
 
-HIER_COLORS = {
-    "pnl": "#3b82f6",
-    "strip": "#22c55e",
-    "unit": "#f59e0b",
-}
+HIER_COLORS = {"pnl": "#3b82f6", "strip": "#22c55e", "unit": "#f59e0b"}
 MAX_PREVIEW_PIXELS = 12_000_000
 
 
@@ -26,7 +21,6 @@ class App(_CoreApp):
     def _ui(self) -> None:
         super()._ui()
 
-        # Composite: separate Add and Edit so selecting an existing row never blocks adding.
         add_button = None
         for child in self.comp_frame.winfo_children():
             try:
@@ -40,13 +34,10 @@ class App(_CoreApp):
         add_button.configure(text="+ 레이어 추가", command=self.add_composite_row)
         add_button.grid_configure(sticky="ew")
         self.comp_tree.grid_configure(columnspan=5)
-        ttk.Button(
-            self.comp_frame,
-            text="선택 레이어 수정",
-            command=self.update_composite_row,
-        ).grid(row=2, column=4, padx=(4, 0), sticky="ew")
+        ttk.Button(self.comp_frame, text="선택 레이어 수정", command=self.update_composite_row).grid(
+            row=2, column=4, padx=(4, 0), sticky="ew"
+        )
 
-        # Hierarchy controls are placed above the existing preview canvas.
         self.hierarchy_enabled = tk.BooleanVar(value=False)
         self.hier_pnl = tk.BooleanVar(value=True)
         self.hier_strip = tk.BooleanVar(value=True)
@@ -69,28 +60,12 @@ class App(_CoreApp):
             command=self._hierarchy_changed,
         ).pack(side="left")
         ttk.Separator(hierarchy_bar, orient="vertical").pack(side="left", fill="y", padx=8)
-        self.pnl_check = ttk.Checkbutton(
-            hierarchy_bar,
-            text="PNL",
-            variable=self.hier_pnl,
-            command=self._hierarchy_changed,
-        )
+        self.pnl_check = ttk.Checkbutton(hierarchy_bar, text="PNL", variable=self.hier_pnl, command=self._hierarchy_changed)
         self.pnl_check.pack(side="left")
-        self.strip_check = ttk.Checkbutton(
-            hierarchy_bar,
-            text="STRIP",
-            variable=self.hier_strip,
-            command=self._hierarchy_changed,
-        )
+        self.strip_check = ttk.Checkbutton(hierarchy_bar, text="STRIP", variable=self.hier_strip, command=self._hierarchy_changed)
         self.strip_check.pack(side="left", padx=(6, 0))
-        self.unit_check = ttk.Checkbutton(
-            hierarchy_bar,
-            text="UNIT",
-            variable=self.hier_unit,
-            command=self._hierarchy_changed,
-        )
+        self.unit_check = ttk.Checkbutton(hierarchy_bar, text="UNIT", variable=self.hier_unit, command=self._hierarchy_changed)
         self.unit_check.pack(side="left", padx=(6, 0))
-
         ttk.Label(hierarchy_bar, text="PNL", foreground=HIER_COLORS["pnl"]).pack(side="left", padx=(14, 2))
         ttk.Label(hierarchy_bar, text="STRIP", foreground=HIER_COLORS["strip"]).pack(side="left", padx=2)
         ttk.Label(hierarchy_bar, text="UNIT", foreground=HIER_COLORS["unit"]).pack(side="left", padx=2)
@@ -146,10 +121,8 @@ class App(_CoreApp):
         return visible
 
     def _root_step(self) -> str:
-        if self.hierarchy_enabled.get() and self.info:
-            available = {name.lower() for name in self.info.steps}
-            if "pnl" in available:
-                return "pnl"
+        if self.hierarchy_enabled.get() and self.info and "pnl" in {name.lower() for name in self.info.steps}:
+            return "pnl"
         return self.step.get()
 
     def schedule_preview(self) -> None:
@@ -175,7 +148,6 @@ class App(_CoreApp):
         layer_name = layer.name if layer else None
         target = "Composite" if specs is not None else (layer_name or "-")
 
-        # Profile parsing is cached; using it here lets us avoid huge PNL preview rasters.
         probe = FastODBRenderer(job, requested_dpi)
         bounds = probe.profile_bounds(root_step)
         effective_dpi = adaptive_preview_dpi(bounds, requested_dpi, MAX_PREVIEW_PIXELS)
@@ -215,7 +187,14 @@ class App(_CoreApp):
 
     def draw(self) -> None:
         super().draw()
-        if self.hierarchy_enabled.get() and self.preview and self._hier_profiles and self._view_bounds:
+        enabled_var = getattr(self, "hierarchy_enabled", None)
+        if (
+            enabled_var is not None
+            and enabled_var.get()
+            and self.preview
+            and getattr(self, "_hier_profiles", None)
+            and getattr(self, "_view_bounds", None)
+        ):
             self._draw_hierarchy_profiles()
 
     def _image_canvas_origin(self) -> tuple[float, float, float, float]:
@@ -223,12 +202,10 @@ class App(_CoreApp):
         height = self.preview.height * self.zoom
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
-        left = cw / 2 + self.offx - width / 2
-        top = ch / 2 + self.offy - height / 2
-        return left, top, width, height
+        return cw / 2 + self.offx - width / 2, ch / 2 + self.offy - height / 2, width, height
 
     def _root_point_to_canvas(self, x_in: float, y_in: float) -> tuple[float, float]:
-        xmin, ymin, xmax, ymax = self._view_bounds
+        xmin, _ymin, _xmax, ymax = self._view_bounds
         left, top, _width, _height = self._image_canvas_origin()
         px = (x_in - xmin) * self._view_dpi_x
         py = (ymax - y_in) * self._view_dpi_y
@@ -272,7 +249,8 @@ class App(_CoreApp):
         super().update_info()
         if not getattr(self, "info_txt", None) or not self.job or not self.info:
             return
-        if not getattr(self, "hierarchy_enabled", None) or not self.hierarchy_enabled.get():
+        enabled_var = getattr(self, "hierarchy_enabled", None)
+        if enabled_var is None or not enabled_var.get():
             return
         visible = ", ".join(name.upper() for name in ("pnl", "strip", "unit") if name in self._visible_hierarchy_steps())
         self.info_txt.configure(state="normal")
