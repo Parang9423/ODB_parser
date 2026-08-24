@@ -19,6 +19,6 @@ jobs:
           pip install -r requirements.txt pytest
       - name: Compile
         run: |
-          python -m py_compile app.py app_core.py odb_cam_renderer.py hierarchy_renderer.py
+          python -m py_compile app.py app_core.py odb_cam_renderer.py hierarchy_renderer.py dump_step_coords.py
       - name: Test
         run: python -m pytest -q
