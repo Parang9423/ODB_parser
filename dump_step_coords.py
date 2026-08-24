@@ -17,6 +17,10 @@ def fmt_point(point) -> str:
     return f"({x:.9f}, {y:.9f}) in / ({x*IN_TO_MM:.6f}, {y*IN_TO_MM:.6f}) mm"
 
 
+def fmt_scalar(value: float) -> str:
+    return f"{value:.9f} in ({value*IN_TO_MM:.6f} mm)"
+
+
 def fmt_bounds(bounds) -> str:
     xmin, ymin, xmax, ymax = bounds
     return (
@@ -44,10 +48,10 @@ def print_step(renderer: FastODBRenderer, step: str) -> None:
 
     print("=" * 100)
     print(f"STEP: {step.upper()}")
-    print(f"X_DATUM  : {fmt_point((frame.x_datum, 0.0)).split(' / ')[0].strip('()').split(',')[0]} in ({frame.x_datum*IN_TO_MM:.6f} mm)")
-    print(f"Y_DATUM  : {frame.y_datum:.9f} in ({frame.y_datum*IN_TO_MM:.6f} mm)")
-    print(f"X_ORIGIN : {frame.x_origin:.9f} in ({frame.x_origin*IN_TO_MM:.6f} mm)")
-    print(f"Y_ORIGIN : {frame.y_origin:.9f} in ({frame.y_origin*IN_TO_MM:.6f} mm)")
+    print(f"X_DATUM  : {fmt_scalar(frame.x_datum)}")
+    print(f"Y_DATUM  : {fmt_scalar(frame.y_datum)}")
+    print(f"X_ORIGIN : {fmt_scalar(frame.x_origin)}")
+    print(f"Y_ORIGIN : {fmt_scalar(frame.y_origin)}")
     print(f"PROFILE  : {fmt_bounds(bounds)}")
     print(f"PROFILE MIN relative to datum: {fmt_point((bounds[0]-frame.x_datum, bounds[1]-frame.y_datum))}")
     print(f"PROFILE MAX relative to datum: {fmt_point((bounds[2]-frame.x_datum, bounds[3]-frame.y_datum))}")
