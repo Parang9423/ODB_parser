@@ -12,6 +12,7 @@ import app_core as core
 from app_core import App as _CoreApp, LayerInfo
 from hierarchy_renderer import FastODBRenderer, adaptive_preview_dpi
 from odb_cam_renderer import CompositeLayer
+from step_composite_renderer import render_selected_steps_composite
 
 core.ODBRenderer = FastODBRenderer
 
@@ -224,7 +225,7 @@ class App(_CoreApp):
         self.status.set(f"미리보기 생성 중 | {len(specs)} layers | {effective:.0f} DPI" + (f" (요청 {requested:g})" if effective < requested-.5 else ""))
         def work() -> None:
             try:
-                renderer = FastODBRenderer(job, effective); image = renderer.render_composite_hierarchy(root, specs, visible)
+                renderer = FastODBRenderer(job, effective); image = render_selected_steps_composite(renderer, root, specs, visible)
                 profiles = [(i.step,i.depth,renderer.transformed_profile(i)) for i in renderer.collect_instances(root) if i.step in visible]
                 if token == self.token:
                     self._view_bounds, self._view_dpi_x, self._view_dpi_y, self._hier_profiles = bounds, renderer.dpi_x, renderer.dpi_y, profiles
@@ -242,14 +243,15 @@ class App(_CoreApp):
             else:
                 x,y=self.valid_um(); args=("aoi",x,y); suffix=f"{x:g}x{y:g}umpp".replace(".","p"); desc=f"AOI X={x:g}, Y={y:g} µm/pixel"
         except Exception: messagebox.showerror("출력 설정 오류", "출력 DPI/AOI 해상도를 확인하세요."); return
-        output=filedialog.asksaveasfilename(title="CAM Image 저장",defaultextension=".png",initialfile=f"{self.info.name}_{root}_composite_{suffix}.png",filetypes=[("PNG Image","*.png")])
+        step_suffix="-".join(step.upper() for step in ("pnl","strip","unit") if step in visible)
+        output=filedialog.asksaveasfilename(title="CAM Image 저장",defaultextension=".png",initialfile=f"{self.info.name}_{step_suffix}_composite_{suffix}.png",filetypes=[("PNG Image","*.png")])
         if not output:return
-        output_path=Path(output); job=self.job; token=self.token; self.render_btn.configure(state="disabled"); self.status.set("최종 Composite CAM 렌더링 중...")
+        output_path=Path(output); job=self.job; token=self.token; self.render_btn.configure(state="disabled"); self.status.set(f"최종 Composite CAM 렌더링 중... Steps={step_suffix}")
         def work() -> None:
             try:
                 renderer=FastODBRenderer(job,args[1]) if args[0]=="dpi" else FastODBRenderer.from_um_per_pixel(job,args[1],args[2])
-                image=renderer.render_composite_hierarchy(root,specs,visible); output_path.parent.mkdir(parents=True,exist_ok=True); image.save(output_path,optimize=True,dpi=(renderer.dpi_x,renderer.dpi_y))
-                self.q.put(("rendered",image,output_path,renderer.stats,desc))
+                image=render_selected_steps_composite(renderer,root,specs,visible); output_path.parent.mkdir(parents=True,exist_ok=True); image.save(output_path,optimize=True,dpi=(renderer.dpi_x,renderer.dpi_y))
+                self.q.put(("rendered",image,output_path,renderer.stats,desc+f" | Steps: {step_suffix}"))
             except Exception as exc:self.q.put(("error",token,f"렌더링 실패: {exc}"))
         threading.Thread(target=work,daemon=True).start()
 
