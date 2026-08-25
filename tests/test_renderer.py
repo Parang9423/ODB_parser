@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from odb_cam_renderer import (
     ODBRenderer,
     RasterCanvas,
@@ -27,6 +29,16 @@ def test_profile_bounds(tmp_path: Path):
 def test_repeat_translation():
     transform = repeat_transform(2.0, 3.0, 0.0, False)
     assert transform.apply((1.0, 1.0)) == (3.0, 4.0)
+
+
+def test_repeat_positive_90_is_clockwise():
+    transform = repeat_transform(0.0, 0.0, 90.0, False)
+    x1, y1 = transform.apply((1.0, 0.0))
+    x2, y2 = transform.apply((0.0, 1.0))
+    assert x1 == pytest.approx(0.0, abs=1e-12)
+    assert y1 == pytest.approx(-1.0, abs=1e-12)
+    assert x2 == pytest.approx(1.0, abs=1e-12)
+    assert y2 == pytest.approx(0.0, abs=1e-12)
 
 
 def test_anisotropic_raster_canvas_size():
