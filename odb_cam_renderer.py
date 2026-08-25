@@ -115,8 +115,14 @@ def parse_repeats(stephdr: Path) -> List[Repeat]:
 
 
 def repeat_transform(x: float, y: float, angle_deg: float, mirror: bool) -> Transform:
+    """Build an ODB++ STEP-REPEAT transform.
+
+    ODB++ STEP-REPEAT positive ANGLE is clockwise in the job coordinate system.
+    The renderer uses a conventional Cartesian transform matrix where positive
+    angles are counter-clockwise, so the ODB angle must be negated here.
+    """
     mirror_x = -1.0 if mirror else 1.0
-    theta = math.radians(angle_deg % 360)
+    theta = -math.radians(angle_deg % 360)
     cs, sn = math.cos(theta), math.sin(theta)
     return Transform(a=cs * mirror_x, b=-sn, c=sn * mirror_x, d=cs, tx=x, ty=y)
 
