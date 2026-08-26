@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Validation pipeline for testing whether AOI image coordinates directly match ODB geometry.
 
-This module intentionally does *not* apply an alignment transform.  It resolves an
-AOI image to its ERT/ODB resources, parses the filename Y/X coordinate and ERT
-resolution, then tests a small set of explicit coordinate hypotheses against ODB
-PNL/STRIP/UNIT profiles.  The goal is to prove the coordinate convention before
-production inference code is built around it.
+G_<Y>_<X>_<idx> images are AOI inference/original images and are validation inputs.
+C_<Y>_<X>_<idx> images are existing CAM images and are intentionally excluded from
+input discovery so that they can later be used as comparison/reference data.
 """
 from __future__ import annotations
 
@@ -15,14 +13,15 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 from aoi.ert import ERTMetadata, parse_ert
 from hierarchy_renderer import FastODBRenderer
 from odb_cam_renderer import extract_input
 
+SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 _IMAGE_RE = re.compile(
-    r"^[^_]+_(?P<y>[+-]?\d+(?:\.\d+)?)_(?P<x>[+-]?\d+(?:\.\d+)?)(?:_(?P<index>[^.]+))?\.png$",
+    r"^(?P<kind>[GC])_(?P<y>[+-]?\d+(?:\.\d+)?)_(?P<x>[+-]?\d+(?:\.\d+)?)(?:_(?P<index>[^.]+))?\.(?P<ext>png|jpe?g)$",
     re.IGNORECASE,
 )
 
@@ -37,6 +36,7 @@ class ImageContext:
     x_mm: float
     y_mm: float
     image_index: str = ""
+    image_kind: str = "G"
 
 
 @dataclass(frozen=True)
@@ -95,13 +95,17 @@ def parse_image_context(image_path: str | Path, gids_root: str | Path) -> ImageC
         raise ValueError(f"Image is not under GIDS root: {image}") from exc
     if len(rel.parts) < 5:
         raise ValueError(
-            "Expected GIDS/<item-revision>/<layer>/<lot>/<panel>/<image>.png; "
+            "Expected GIDS/<item-revision>/<layer>/<lot>/<panel>/<image>; "
             f"got relative path: {rel}"
         )
     item_revision, layer, lot, panel = rel.parts[-5:-1]
     match = _IMAGE_RE.match(image.name)
     if not match:
-        raise ValueError(f"Image filename does not match G_<Y>_<X>_<index>.png style: {image.name}")
+        raise ValueError(
+            "Image filename must be G_<Y>_<X>_<idx> or C_<Y>_<X>_<idx> with png/jpg/jpeg extension: "
+            f"{image.name}"
+        )
+    kind = match.group("kind").upper()
     return ImageContext(
         image_path=image,
         item_revision=item_revision,
@@ -111,6 +115,7 @@ def parse_image_context(image_path: str | Path, gids_root: str | Path) -> ImageC
         x_mm=float(match.group("x")),
         y_mm=float(match.group("y")),
         image_index=match.group("index") or "",
+        image_kind=kind,
     )
 
 
@@ -126,7 +131,6 @@ def _casefold_child(parent: Path, name: str) -> Optional[Path]:
 
 def resolve_resources(root: str | Path, context: ImageContext) -> ResourceContext:
     root = Path(root).resolve()
-    # ERT root may be ROOT/ERT/<item> or directly ROOT/<item>, matching the test layout discussion.
     ert_base = root / "ERT" if (root / "ERT").is_dir() else root
     item_dir = _casefold_child(ert_base, context.item_revision)
     if item_dir is None:
@@ -141,7 +145,6 @@ def resolve_resources(root: str | Path, context: ImageContext) -> ResourceContex
     if not ert_files:
         raise FileNotFoundError(f"No ERT file found under {lot_dir}")
 
-    # Prefer a panel token match when filenames expose it; otherwise only accept an unambiguous single ERT.
     panel_key = context.panel.casefold()
     matched = [p for p in ert_files if panel_key in p.stem.casefold()]
     if len(matched) == 1:
@@ -173,12 +176,6 @@ def resolve_resources(root: str | Path, context: ImageContext) -> ResourceContex
 
 
 def coordinate_hypotheses(x_mm: float, y_mm: float, pnl_bounds_in: Sequence[float]) -> list[CoordinateHypothesis]:
-    """Return explicit hypotheses; no hidden calibration is applied.
-
-    DIRECT_LOCAL is the user's current hypothesis: AOI (0,0) equals ODB local (0,0).
-    The other variants are diagnostics only, useful for detecting whether the AOI origin
-    instead corresponds to a PNL profile corner or whether Y direction is inverted.
-    """
     xmin, ymin, xmax, ymax = map(float, pnl_bounds_in)
     x_in, y_in = x_mm / 25.4, y_mm / 25.4
     return [
@@ -217,22 +214,19 @@ def step_hits(renderer: FastODBRenderer, root_step: str, point_in: tuple[float, 
             bounds = renderer.profile_bounds(instance.step)
         except Exception:
             continue
-        inside = _point_in_bounds(local, bounds)
-        if inside:
+        if _point_in_bounds(local, bounds):
             hits.append(StepHit(
-                step=instance.step.upper(),
-                instance_index=index,
-                inside=True,
-                local_x_mm=local[0] * 25.4,
-                local_y_mm=local[1] * 25.4,
+                step=instance.step.upper(), instance_index=index, inside=True,
+                local_x_mm=local[0] * 25.4, local_y_mm=local[1] * 25.4,
             ))
     return hits
 
 
 def validate_image(root: str | Path, image_path: str | Path) -> tuple[list[ValidationResult], dict]:
     root = Path(root).resolve()
-    gids_root = root / "GIDS"
-    context = parse_image_context(image_path, gids_root)
+    context = parse_image_context(image_path, root / "GIDS")
+    if context.image_kind != "G":
+        raise ValueError(f"Only G_ inference/original images are validation inputs: {context.image_path.name}")
     resources = resolve_resources(root, context)
     ert: ERTMetadata = parse_ert(resources.ert_path)
 
@@ -270,10 +264,7 @@ def validate_image(root: str | Path, image_path: str | Path) -> tuple[list[Valid
                 pnl_inside=pnl_inside, strip_hits=strip_hits_count, unit_hits=unit_hits_count, deepest_step=deepest,
             )
             results.append(result)
-            detail["hypotheses"].append({
-                **asdict(result),
-                "step_hits": [asdict(hit) for hit in hits],
-            })
+            detail["hypotheses"].append({**asdict(result), "step_hits": [asdict(hit) for hit in hits]})
         return results, detail
     finally:
         if temp_dir is not None:
@@ -281,8 +272,16 @@ def validate_image(root: str | Path, image_path: str | Path) -> tuple[list[Valid
 
 
 def discover_images(root: str | Path, limit: Optional[int] = None) -> list[Path]:
+    """Discover only G_ inference/original images; C_ CAM images are excluded."""
     gids = Path(root) / "GIDS"
-    images = sorted(p for p in gids.rglob("*.png") if p.is_file())
+    images: list[Path] = []
+    for path in gids.rglob("*"):
+        if not path.is_file() or path.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES:
+            continue
+        match = _IMAGE_RE.match(path.name)
+        if match and match.group("kind").upper() == "G":
+            images.append(path)
+    images.sort()
     return images if limit is None else images[: max(0, limit)]
 
 
@@ -292,7 +291,9 @@ def run_validation(root: str | Path, output_dir: str | Path, limit: Optional[int
     output.mkdir(parents=True, exist_ok=True)
     images = discover_images(root, limit)
     if not images:
-        raise FileNotFoundError(f"No PNG images found under {root / 'GIDS'}")
+        raise FileNotFoundError(
+            f"No G_ inference images (.png/.jpg/.jpeg) found under {root / 'GIDS'}"
+        )
 
     rows: list[dict] = []
     details: list[dict] = []
@@ -315,19 +316,19 @@ def run_validation(root: str | Path, output_dir: str | Path, limit: Optional[int
         encoding="utf-8",
     )
 
-    print(f"Images checked : {len(images)}")
-    print(f"Rows written   : {len(rows)}")
-    print(f"Failures       : {len(failures)}")
-    print(f"CSV            : {csv_path}")
-    print(f"JSON           : {output / 'coordinate_validation.json'}")
+    print(f"G images checked: {len(images)}")
+    print(f"Rows written    : {len(rows)}")
+    print(f"Failures        : {len(failures)}")
+    print(f"CSV             : {csv_path}")
+    print(f"JSON            : {output / 'coordinate_validation.json'}")
     return 0 if not failures else 2
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate AOI filename coordinates against ODB step geometry")
+    parser = argparse.ArgumentParser(description="Validate G_ AOI image coordinates against ODB step geometry")
     parser.add_argument("root", type=Path, help="Test root containing GIDS/, ODB/, and ERT data")
     parser.add_argument("--output", type=Path, default=Path("validation_output"))
-    parser.add_argument("--limit", type=int, default=None, help="Only inspect the first N PNG files")
+    parser.add_argument("--limit", type=int, default=None, help="Only inspect the first N G_ images")
     args = parser.parse_args()
     return run_validation(args.root, args.output, args.limit)
 
