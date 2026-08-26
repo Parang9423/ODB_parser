@@ -77,15 +77,23 @@ def main() -> int:
 
         # Render signal and drill separately so the comparison report tells us which contributes.
         signal = render_selected_steps_composite(
-            renderer, root, [CompositeLayer(selection.signal_layer, args.signal_gv, "REPLACE")],
-            visible, include_profiles=False, background=0,
+            renderer,
+            root,
+            [CompositeLayer(layer=selection.signal_layer, operation="REPLACE", gv=args.signal_gv)],
+            visible,
+            include_profiles=False,
+            background=0,
         )
         drill = Image.new("L", signal.size, 0)
         rendered_drills = []
         for layer in selection.drill_layers:
             mask = render_selected_steps_composite(
-                renderer, root, [CompositeLayer(layer, 255, "REPLACE")],
-                visible, include_profiles=False, background=0,
+                renderer,
+                root,
+                [CompositeLayer(layer=layer, operation="REPLACE", gv=255)],
+                visible,
+                include_profiles=False,
+                background=0,
             )
             if nonzero(mask):
                 drill = ImageChops.lighter(drill, mask)
