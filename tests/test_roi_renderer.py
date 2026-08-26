@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from render.roi import roi_bounds_in, select_roi_layers
 
 
@@ -48,7 +50,7 @@ POLARITY=POSITIVE
     assert selected.drill_layers == ("DLD_1-2",)
 
 
-def test_select_roi_layers_falls_back_to_unique_orientation(tmp_path: Path):
+def test_select_roi_layers_never_falls_back_to_other_physical_layer(tmp_path: Path):
     job = tmp_path / "job"
     _write_matrix(job, """
 LAYER {
@@ -65,21 +67,21 @@ CONTEXT=BOARD
 SIDE=TOP
 POLARITY=POSITIVE
 }
-LAYER {
-NAME=DLD_1-2
-TYPE=DRILL
-CONTEXT=BOARD
-SIDE=NONE
-POLARITY=POSITIVE
-}
 """)
-    selected = select_roi_layers(job, "L1-TU-11-T-025")
-    assert selected.signal_layer == "L2_TU"
+    with pytest.raises(ValueError, match="Refusing to fall back"):
+        select_roi_layers(job, "L1-TU-11-T-025")
 
 
-def test_select_roi_layers_prefers_both_tokens_when_available(tmp_path: Path):
+def test_select_roi_layers_uses_orientation_only_within_same_layer_number(tmp_path: Path):
     job = tmp_path / "job"
     _write_matrix(job, """
+LAYER {
+NAME=L1_TD
+TYPE=SIGNAL
+CONTEXT=BOARD
+SIDE=TOP
+POLARITY=POSITIVE
+}
 LAYER {
 NAME=L1_TU
 TYPE=SIGNAL
