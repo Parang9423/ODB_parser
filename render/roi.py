@@ -2,8 +2,8 @@
 """Small ROI CAM rendering for AOI coordinate validation.
 
 The renderer draws only the requested physical window instead of rasterizing the
-whole panel.  SIGNAL features are rendered at GV 255 and drill-like features at
-GV 125 by default.  PNL/STRIP/UNIT hierarchy transforms are still applied.
+whole panel. SIGNAL features are rendered at GV 255 and drill-like features at
+GV 125 by default. PNL/STRIP/UNIT hierarchy transforms are still applied.
 """
 from __future__ import annotations
 
@@ -54,9 +54,20 @@ def roi_bounds_in(center_x_mm: float, center_y_mm: float, resolution_um_per_px: 
     )
 
 
-def _layer_token(recipe_layer: str) -> str:
-    match = re.match(r"^(L\d+)", recipe_layer.strip(), flags=re.I)
-    return match.group(1) if match else recipe_layer.strip().split("-", 1)[0]
+def _recipe_tokens(recipe_layer: str) -> tuple[str | None, str | None]:
+    """Extract only the useful AOI layer identity tokens.
+
+    Example: L1-TU-11-T-025 -> ("L1", "TU").
+    The trailing recipe/spec tokens are intentionally ignored.
+    """
+    parts = [part for part in re.split(r"[-_]+", recipe_layer.strip().upper()) if part]
+    layer_no = next((part for part in parts if re.fullmatch(r"L\d+", part)), None)
+    orientation = next((part for part in parts if part in {"TU", "TD", "BU", "BD"}), None)
+    return layer_no, orientation
+
+
+def _normalized_layer_parts(name: str) -> set[str]:
+    return {part for part in re.split(r"[-_]+", name.strip().upper()) if part}
 
 
 def select_roi_layers(job: Path, recipe_layer: str) -> ROILayerSelection:
@@ -65,23 +76,53 @@ def select_roi_layers(job: Path, recipe_layer: str) -> ROILayerSelection:
     if not signal_layers:
         raise ValueError("ODB Matrix contains no SIGNAL layer")
 
-    token = _layer_token(recipe_layer).casefold()
-    exact = [layer.name for layer in signal_layers if layer.name.casefold() == token]
-    if len(exact) == 1:
-        signal = exact[0]
-    else:
-        prefix = [layer.name for layer in signal_layers if layer.name.casefold().startswith(token)]
-        if len(prefix) == 1:
-            signal = prefix[0]
-        else:
-            names = ", ".join(layer.name for layer in signal_layers)
-            raise ValueError(
-                f"Could not uniquely map AOI layer {recipe_layer!r} to ODB SIGNAL layer. "
-                f"Derived token={token!r}; SIGNAL layers=[{names}]"
-            )
+    layer_no, orientation = _recipe_tokens(recipe_layer)
+    selected = None
+
+    # 1) Prefer an exact layer-number match when ODB has the same naming.
+    if layer_no:
+        exact_layer = [layer.name for layer in signal_layers if layer.name.upper() == layer_no]
+        if len(exact_layer) == 1:
+            selected = exact_layer[0]
+
+    # 2) Then try both useful AOI tokens together (e.g. L1 + TU).
+    if selected is None and layer_no and orientation:
+        both = [
+            layer.name for layer in signal_layers
+            if {layer_no, orientation}.issubset(_normalized_layer_parts(layer.name))
+        ]
+        if len(both) == 1:
+            selected = both[0]
+
+    # 3) Some AOI recipe layer numbers do not equal the ODB SIGNAL number.
+    #    In that case TU/TD/BU/BD is the stable discriminator; use it only
+    #    when it maps to exactly one SIGNAL layer.
+    if selected is None and orientation:
+        by_orientation = [
+            layer.name for layer in signal_layers
+            if orientation in _normalized_layer_parts(layer.name)
+        ]
+        if len(by_orientation) == 1:
+            selected = by_orientation[0]
+
+    # 4) Last fallback: layer number appears as a component of an ODB name.
+    if selected is None and layer_no:
+        by_layer = [
+            layer.name for layer in signal_layers
+            if layer_no in _normalized_layer_parts(layer.name)
+        ]
+        if len(by_layer) == 1:
+            selected = by_layer[0]
+
+    if selected is None:
+        names = ", ".join(layer.name for layer in signal_layers)
+        raise ValueError(
+            f"Could not uniquely map AOI layer {recipe_layer!r} to ODB SIGNAL layer. "
+            f"Parsed layer={layer_no!r}, orientation={orientation!r}; SIGNAL layers=[{names}]"
+        )
 
     drills = tuple(layer.name for layer in info.layers if is_drill_layer(layer))
-    return ROILayerSelection(signal_layer=signal, drill_layers=drills)
+    return ROILayerSelection(signal_layer=selected, drill_layers=drills)
 
 
 def _render_layer_mask(renderer: FastODBRenderer, root_step: str, layer: str,
