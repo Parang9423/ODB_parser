@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Generate 100x100 ODB CAM crops from coordinate_validation.json."""
+"""Generate ODB CAM crops from coordinate_validation.json.
+
+Use --diagnostic-first to render the first validation image at 100/500/2000 px
+with the same ERT resolution. This makes coordinate-vs-renderer problems easy to
+separate without changing the coordinate hypothesis.
+"""
 from __future__ import annotations
 
 import argparse
@@ -27,11 +32,77 @@ def _find_hypothesis(detail: dict, name: str) -> dict:
     raise KeyError(f"Hypothesis {name!r} not found for {detail.get('image_context', {}).get('image_path')}")
 
 
+def _step_hit_summary(row: dict) -> dict:
+    hits = list(row.get("step_hits", []))
+    return {
+        "pnl_hits": sum(str(hit.get("step", "")).upper() == "PNL" for hit in hits),
+        "strip_hits": sum(str(hit.get("step", "")).upper() == "STRIP" for hit in hits),
+        "unit_hits": sum(str(hit.get("step", "")).upper() == "UNIT" for hit in hits),
+        "step_hits": hits,
+    }
+
+
+def _diagnose_first(detail: dict, output: Path, hypothesis: str,
+                    signal_gv: int, drill_gv: int,
+                    odb_cache: dict[str, tuple[Path, object | None]]) -> dict:
+    image_info = detail.get("image_context", {})
+    resources = detail.get("resources", {})
+    ert = detail.get("ert", {})
+    image_path = Path(image_info.get("image_path", ""))
+    row = _find_hypothesis(detail, hypothesis)
+    odb_path = str(resources["odb_path"])
+    if odb_path not in odb_cache:
+        job, temp_dir = extract_input(Path(odb_path))
+        odb_cache[odb_path] = (job, temp_dir)
+    job = odb_cache[odb_path][0]
+
+    resolution = float(ert["resolution_um_per_px"])
+    recipe_layer = str(image_info["layer"])
+    center_x_mm = float(row["odb_x_mm"])
+    center_y_mm = float(row["odb_y_mm"])
+    diag_dir = output / "diagnostic_first"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+
+    runs: list[dict] = []
+    for size in (100, 500, 2000):
+        cam, meta = render_roi_cam(
+            job=job,
+            center_x_mm=center_x_mm,
+            center_y_mm=center_y_mm,
+            resolution_um_per_px=resolution,
+            recipe_layer=recipe_layer,
+            width_px=size,
+            height_px=size,
+            signal_gv=signal_gv,
+            drill_gv=drill_gv,
+        )
+        out_path = diag_dir / f"{image_path.stem}_{hypothesis}_{size}x{size}.png"
+        cam.save(out_path, format="PNG", compress_level=1, optimize=False)
+        runs.append({"output_cam": str(out_path), **meta})
+
+    diagnostic = {
+        "source_image": str(image_path),
+        "hypothesis": hypothesis,
+        "aoi_coordinate_mm": [float(row.get("aoi_x_mm", image_info.get("x_mm", 0.0))),
+                              float(row.get("aoi_y_mm", image_info.get("y_mm", 0.0)))],
+        "odb_coordinate_mm": [center_x_mm, center_y_mm],
+        "resolution_um_per_px": resolution,
+        "recipe_layer": recipe_layer,
+        **_step_hit_summary(row),
+        "renders": runs,
+    }
+    (diag_dir / "diagnostic.json").write_text(
+        json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return diagnostic
+
+
 def generate_from_validation_json(validation_json: str | Path, output_dir: str | Path,
                                   hypothesis: str = "DIRECT_LOCAL",
                                   width_px: int = 100, height_px: int = 100,
                                   signal_gv: int = 255, drill_gv: int = 125,
-                                  limit: int | None = None) -> int:
+                                  limit: int | None = None,
+                                  diagnostic_first: bool = False) -> int:
     src = Path(validation_json).resolve()
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -45,7 +116,32 @@ def generate_from_validation_json(validation_json: str | Path, output_dir: str |
     odb_cache: dict[str, tuple[Path, object | None]] = {}
     generated: list[dict] = []
     failures: list[dict] = []
+    diagnostic = None
     try:
+        if diagnostic_first:
+            try:
+                diagnostic = _diagnose_first(
+                    details[0], output, hypothesis, signal_gv, drill_gv, odb_cache
+                )
+                print("Diagnostic first image completed")
+                for render in diagnostic["renders"]:
+                    print(
+                        f"  {render['size_px'][0]}x{render['size_px'][1]} | "
+                        f"signal={render['signal_nonzero_pixels']} "
+                        f"drill={render['drill_nonzero_pixels']} "
+                        f"final={render['final_nonzero_pixels']}"
+                    )
+                print(
+                    f"  STEP hits | PNL={diagnostic['pnl_hits']} "
+                    f"STRIP={diagnostic['strip_hits']} UNIT={diagnostic['unit_hits']}"
+                )
+            except Exception as exc:
+                failures.append({
+                    "image": str(details[0].get("image_context", {}).get("image_path", "")),
+                    "stage": "diagnostic_first",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
         for detail in details:
             image_info = detail.get("image_context", {})
             resources = detail.get("resources", {})
@@ -86,11 +182,13 @@ def generate_from_validation_json(validation_json: str | Path, output_dir: str |
                     "output_cam": str(out_path),
                     "hypothesis": hypothesis,
                     "coordinate_mm": [center_x_mm, center_y_mm],
+                    **_step_hit_summary(row),
                     **meta,
                 })
             except Exception as exc:
                 failures.append({
                     "image": str(image_path),
+                    "stage": "normal_generation",
                     "error": f"{type(exc).__name__}: {exc}",
                 })
     finally:
@@ -100,7 +198,8 @@ def generate_from_validation_json(validation_json: str | Path, output_dir: str |
 
     report = output / "cam_crop_generation.json"
     report.write_text(
-        json.dumps({"generated": generated, "failures": failures}, ensure_ascii=False, indent=2),
+        json.dumps({"diagnostic_first": diagnostic, "generated": generated, "failures": failures},
+                   ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print(f"Validation rows : {len(details)}")
@@ -120,6 +219,10 @@ def main() -> int:
     parser.add_argument("--signal-gv", type=int, default=255)
     parser.add_argument("--drill-gv", type=int, default=125)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--diagnostic-first", action="store_true",
+        help="Render first image at 100/500/2000 px and write diagnostic_first/diagnostic.json",
+    )
     args = parser.parse_args()
     return generate_from_validation_json(
         args.validation_json,
@@ -130,6 +233,7 @@ def main() -> int:
         signal_gv=args.signal_gv,
         drill_gv=args.drill_gv,
         limit=args.limit,
+        diagnostic_first=args.diagnostic_first,
     )
 
 
