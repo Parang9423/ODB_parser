@@ -1,6 +1,11 @@
 from pathlib import Path
 
-from aoi.coordinate_validation import coordinate_hypotheses, discover_images, parse_image_context
+from aoi.coordinate_validation import (
+    _match_ert_for_panel,
+    coordinate_hypotheses,
+    discover_images,
+    parse_image_context,
+)
 
 
 def test_parse_image_context_y_x_order_png(tmp_path: Path):
@@ -40,6 +45,18 @@ def test_discover_images_only_returns_g_inputs_and_supports_jpg(tmp_path: Path):
     for path in (g_jpg, g_png, cam, unrelated):
         path.write_bytes(b"")
     assert discover_images(tmp_path) == sorted([g_jpg, g_png])
+
+
+def test_zero_padded_ert_panel_resolution(tmp_path: Path):
+    files = []
+    for name in ("001.ERT", "002.ERT", "010.ERT"):
+        path = tmp_path / name
+        path.write_text("", encoding="utf-8")
+        files.append(path)
+    assert _match_ert_for_panel(files, "1").name == "001.ERT"
+    assert _match_ert_for_panel(files, "01").name == "001.ERT"
+    assert _match_ert_for_panel(files, "2").name == "002.ERT"
+    assert _match_ert_for_panel(files, "10").name == "010.ERT"
 
 
 def test_coordinate_hypotheses_keep_direct_local_explicit():
