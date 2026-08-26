@@ -71,55 +71,57 @@ def _normalized_layer_parts(name: str) -> set[str]:
 
 
 def select_roi_layers(job: Path, recipe_layer: str) -> ROILayerSelection:
+    """Map AOI recipe layer to ODB SIGNAL layer.
+
+    The AOI physical layer number is authoritative.  For example,
+    L1-TU-11-T-025 must map only to an ODB SIGNAL layer whose normalized
+    name contains L1.  TU/TD/BU/BD is used only to disambiguate multiple
+    candidates with the same layer number; it must never cause fallback to
+    another physical layer such as L2.
+    """
     info = inspect_job(job)
     signal_layers = [layer for layer in info.layers if layer.layer_type.upper() == "SIGNAL"]
     if not signal_layers:
         raise ValueError("ODB Matrix contains no SIGNAL layer")
 
     layer_no, orientation = _recipe_tokens(recipe_layer)
-    selected = None
+    if not layer_no:
+        raise ValueError(f"Could not extract physical layer number from AOI layer {recipe_layer!r}")
 
-    # 1) Prefer an exact layer-number match when ODB has the same naming.
-    if layer_no:
-        exact_layer = [layer.name for layer in signal_layers if layer.name.upper() == layer_no]
-        if len(exact_layer) == 1:
-            selected = exact_layer[0]
+    # Physical layer number is mandatory and authoritative.
+    by_layer = [
+        layer.name for layer in signal_layers
+        if layer_no in _normalized_layer_parts(layer.name) or layer.name.upper() == layer_no
+    ]
 
-    # 2) Then try both useful AOI tokens together (e.g. L1 + TU).
-    if selected is None and layer_no and orientation:
-        both = [
-            layer.name for layer in signal_layers
-            if {layer_no, orientation}.issubset(_normalized_layer_parts(layer.name))
-        ]
-        if len(both) == 1:
-            selected = both[0]
-
-    # 3) Some AOI recipe layer numbers do not equal the ODB SIGNAL number.
-    #    In that case TU/TD/BU/BD is the stable discriminator; use it only
-    #    when it maps to exactly one SIGNAL layer.
-    if selected is None and orientation:
-        by_orientation = [
-            layer.name for layer in signal_layers
-            if orientation in _normalized_layer_parts(layer.name)
-        ]
-        if len(by_orientation) == 1:
-            selected = by_orientation[0]
-
-    # 4) Last fallback: layer number appears as a component of an ODB name.
-    if selected is None and layer_no:
-        by_layer = [
-            layer.name for layer in signal_layers
-            if layer_no in _normalized_layer_parts(layer.name)
-        ]
-        if len(by_layer) == 1:
-            selected = by_layer[0]
-
-    if selected is None:
+    if not by_layer:
         names = ", ".join(layer.name for layer in signal_layers)
         raise ValueError(
-            f"Could not uniquely map AOI layer {recipe_layer!r} to ODB SIGNAL layer. "
-            f"Parsed layer={layer_no!r}, orientation={orientation!r}; SIGNAL layers=[{names}]"
+            f"No ODB SIGNAL layer matches AOI physical layer {layer_no!r} from {recipe_layer!r}. "
+            f"Refusing to fall back to another physical layer. SIGNAL layers=[{names}]"
         )
+
+    if len(by_layer) == 1:
+        selected = by_layer[0]
+    else:
+        # Orientation is only a secondary discriminator among the SAME layer number.
+        if orientation:
+            oriented = [
+                name for name in by_layer
+                if orientation in _normalized_layer_parts(name)
+            ]
+            if len(oriented) == 1:
+                selected = oriented[0]
+            else:
+                raise ValueError(
+                    f"Multiple ODB SIGNAL layers match physical layer {layer_no!r}, but orientation "
+                    f"{orientation!r} is not unique. Candidates={by_layer}"
+                )
+        else:
+            raise ValueError(
+                f"Multiple ODB SIGNAL layers match physical layer {layer_no!r} and AOI recipe has no "
+                f"orientation discriminator. Candidates={by_layer}"
+            )
 
     drills = tuple(layer.name for layer in info.layers if is_drill_layer(layer))
     return ROILayerSelection(signal_layer=selected, drill_layers=drills)
