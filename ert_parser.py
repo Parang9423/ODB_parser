@@ -26,7 +26,6 @@ class ERTMetadata:
     trailing_value: float
     timestamp: Optional[Tuple[int, int, int, int, int, int]] = None
 
-    @property
     def roi_size_mm_for_pixels(self, width_px: int, height_px: int) -> Tuple[float, float]:
         scale_mm = self.resolution_um_per_px / 1000.0
         return width_px * scale_mm, height_px * scale_mm
@@ -52,8 +51,6 @@ def parse_ert(path: str | Path) -> ERTMetadata:
     if len(lines) < 3:
         raise ValueError(f"ERT footer not found: {path}")
 
-    # Footer is expected at the end, but scan a small tail window so a vendor
-    # comment or blank line does not break parsing.
     geometry = None
     geometry_index = None
     for index in range(len(lines) - 3, max(-1, len(lines) - 12), -1):
