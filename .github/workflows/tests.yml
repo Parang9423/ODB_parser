@@ -19,6 +19,12 @@ jobs:
           pip install -r requirements.txt pytest
       - name: Compile
         run: |
-          python -m py_compile app.py app_core.py odb_cam_renderer.py hierarchy_renderer.py step_composite_renderer.py dump_step_coords.py ert_parser.py guide_drill.py
+          python -m py_compile \
+            app.py app_core.py odb_cam_renderer.py hierarchy_renderer.py \
+            step_composite_renderer.py dump_step_coords.py ert_parser.py guide_drill.py \
+            aoi/__init__.py aoi/ert.py \
+            alignment/__init__.py alignment/guide_drill.py \
+            render/__init__.py render/hierarchy.py render/composite.py \
+            ui/__init__.py ui/defaults.py ui/platform.py ui/layer_dialog.py ui/main_window.py
       - name: Test
         run: python -m pytest -q
