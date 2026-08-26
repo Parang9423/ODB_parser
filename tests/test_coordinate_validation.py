@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from aoi.coordinate_validation import coordinate_hypotheses, parse_image_context
+from aoi.coordinate_validation import coordinate_hypotheses, discover_images, parse_image_context
 
 
-def test_parse_image_context_y_x_order(tmp_path: Path):
+def test_parse_image_context_y_x_order_png(tmp_path: Path):
     image = tmp_path / "GIDS" / "MCP19013C00-006" / "L1-13-T-050" / "LOT001" / "PANEL001" / "G_23.465_471.321_6.png"
     image.parent.mkdir(parents=True)
     image.write_bytes(b"")
@@ -15,6 +15,31 @@ def test_parse_image_context_y_x_order(tmp_path: Path):
     assert ctx.y_mm == 23.465
     assert ctx.x_mm == 471.321
     assert ctx.image_index == "6"
+    assert ctx.image_kind == "G"
+
+
+def test_parse_image_context_supports_jpg_and_cam_prefix(tmp_path: Path):
+    panel = tmp_path / "GIDS" / "ITEM-001" / "L1" / "LOT1" / "PANEL1"
+    panel.mkdir(parents=True)
+    cam = panel / "C_10.125_20.250_3.jpg"
+    cam.write_bytes(b"")
+    ctx = parse_image_context(cam, tmp_path / "GIDS")
+    assert ctx.image_kind == "C"
+    assert ctx.y_mm == 10.125
+    assert ctx.x_mm == 20.250
+    assert ctx.image_index == "3"
+
+
+def test_discover_images_only_returns_g_inputs_and_supports_jpg(tmp_path: Path):
+    panel = tmp_path / "GIDS" / "ITEM-001" / "L1" / "LOT1" / "PANEL1"
+    panel.mkdir(parents=True)
+    g_jpg = panel / "G_1.000_2.000_1.jpg"
+    g_png = panel / "G_3.000_4.000_2.PNG"
+    cam = panel / "C_1.000_2.000_1.jpg"
+    unrelated = panel / "other.jpg"
+    for path in (g_jpg, g_png, cam, unrelated):
+        path.write_bytes(b"")
+    assert discover_images(tmp_path) == sorted([g_jpg, g_png])
 
 
 def test_coordinate_hypotheses_keep_direct_local_explicit():
