@@ -1,0 +1,47 @@
+from pathlib import Path
+
+from render.roi import roi_bounds_in, select_roi_layers
+
+
+def test_roi_bounds_are_centered_and_match_resolution():
+    bounds = roi_bounds_in(100.0, 200.0, 5.0, 100, 100)
+    xmin, ymin, xmax, ymax = bounds
+    assert abs(((xmin + xmax) / 2.0) * 25.4 - 100.0) < 1e-9
+    assert abs(((ymin + ymax) / 2.0) * 25.4 - 200.0) < 1e-9
+    assert abs((xmax - xmin) * 25.4 - 0.5) < 1e-9
+    assert abs((ymax - ymin) * 25.4 - 0.5) < 1e-9
+
+
+def test_select_roi_layers_maps_recipe_l1_and_drill(tmp_path: Path):
+    job = tmp_path / "job"
+    (job / "steps" / "pnl").mkdir(parents=True)
+    (job / "matrix").mkdir(parents=True)
+    (job / "matrix" / "matrix").write_text(
+        """
+LAYER {
+NAME=L1
+TYPE=SIGNAL
+CONTEXT=BOARD
+SIDE=TOP
+POLARITY=POSITIVE
+}
+LAYER {
+NAME=L2
+TYPE=SIGNAL
+CONTEXT=BOARD
+SIDE=INTERNAL
+POLARITY=POSITIVE
+}
+LAYER {
+NAME=DLD_1-2
+TYPE=DRILL
+CONTEXT=BOARD
+SIDE=NONE
+POLARITY=POSITIVE
+}
+""",
+        encoding="utf-8",
+    )
+    selected = select_roi_layers(job, "L1-TU-11-T-025")
+    assert selected.signal_layer == "L1"
+    assert selected.drill_layers == ("DLD_1-2",)
