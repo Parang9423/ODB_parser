@@ -129,6 +129,46 @@ def _casefold_child(parent: Path, name: str) -> Optional[Path]:
     return None
 
 
+def _numeric_panel_id(value: str) -> Optional[int]:
+    """Return a normalized numeric panel id for values such as 1/01/001.
+
+    Non-numeric panel names intentionally return None so we do not silently map
+    unrelated ERT filenames.
+    """
+    text = value.strip()
+    return int(text) if text.isdigit() else None
+
+
+def _match_ert_for_panel(ert_files: Sequence[Path], panel: str) -> Path:
+    """Resolve panel folder names to ERT files, tolerating zero padding.
+
+    Examples: panel folder 1 -> 001.ERT, 01 -> 001.ERT, 10 -> 010.ERT.
+    Exact case-insensitive stem matching remains supported for non-numeric names.
+    """
+    panel_key = panel.casefold()
+    exact = [p for p in ert_files if p.stem.casefold() == panel_key]
+    if len(exact) == 1:
+        return exact[0]
+
+    panel_id = _numeric_panel_id(panel)
+    if panel_id is not None:
+        numeric = [p for p in ert_files if _numeric_panel_id(p.stem) == panel_id]
+        if len(numeric) == 1:
+            return numeric[0]
+        if len(numeric) > 1:
+            raise RuntimeError(
+                f"Multiple ERT files normalize to panel {panel!r}: "
+                + ", ".join(p.name for p in numeric)
+            )
+
+    if len(ert_files) == 1:
+        return ert_files[0]
+    raise RuntimeError(
+        f"Multiple ERT files found but panel {panel!r} could not be resolved: "
+        + ", ".join(p.name for p in ert_files[:10])
+    )
+
+
 def resolve_resources(root: str | Path, context: ImageContext) -> ResourceContext:
     root = Path(root).resolve()
     ert_base = root / "ERT" if (root / "ERT").is_dir() else root
@@ -145,17 +185,7 @@ def resolve_resources(root: str | Path, context: ImageContext) -> ResourceContex
     if not ert_files:
         raise FileNotFoundError(f"No ERT file found under {lot_dir}")
 
-    panel_key = context.panel.casefold()
-    matched = [p for p in ert_files if panel_key in p.stem.casefold()]
-    if len(matched) == 1:
-        ert = matched[0]
-    elif len(ert_files) == 1:
-        ert = ert_files[0]
-    else:
-        raise RuntimeError(
-            f"Multiple ERT files found for lot {context.lot} but panel {context.panel!r} could not be resolved: "
-            + ", ".join(p.name for p in ert_files[:10])
-        )
+    ert = _match_ert_for_panel(ert_files, context.panel)
 
     odb_dir = root / "ODB"
     if not odb_dir.is_dir():
