@@ -22,9 +22,10 @@ jobs:
           python -m py_compile \
             app.py app_core.py odb_cam_renderer.py hierarchy_renderer.py \
             step_composite_renderer.py dump_step_coords.py ert_parser.py guide_drill.py \
-            aoi/__init__.py aoi/ert.py \
+            validate_coordinates.py generate_cam_crops.py \
+            aoi/__init__.py aoi/ert.py aoi/coordinate_validation.py \
             alignment/__init__.py alignment/guide_drill.py \
-            render/__init__.py render/hierarchy.py render/composite.py \
+            render/__init__.py render/hierarchy.py render/composite.py render/roi.py \
             ui/__init__.py ui/defaults.py ui/platform.py ui/layer_dialog.py ui/main_window.py
       - name: Test
         run: python -m pytest -q
