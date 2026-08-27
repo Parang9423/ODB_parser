@@ -34,7 +34,12 @@ class ROILayerSelection:
 
 
 class FixedRasterCanvas(RasterCanvas):
-    """RasterCanvas with an exact requested output size."""
+    """RasterCanvas with an exact requested output size.
+
+    Surface objects are composed through a per-surface mask. This is important
+    because H contours belong to their own surface and must not erase copper
+    deposited by a different positive surface rendered earlier.
+    """
 
     def __init__(self, bounds, dpi_x: float, dpi_y: float, width_px: int, height_px: int, background: int = 0):
         self.xmin, self.ymin, self.xmax, self.ymax = bounds
@@ -43,6 +48,30 @@ class FixedRasterCanvas(RasterCanvas):
         self.dpi = self.dpi_x
         self.margin = 0
         self.image = Image.new("L", (int(width_px), int(height_px)), color=int(background))
+        self.draw = ImageDraw.Draw(self.image)
+
+    def draw_surface(self, contours, polarity: str) -> None:
+        # Build the geometry of one ODB surface independently: I contours add
+        # material inside the surface; H contours remove material only from this
+        # temporary surface mask.
+        surface_mask = Image.new("L", self.image.size, 0)
+        surface_draw = ImageDraw.Draw(surface_mask)
+        for kind, points in contours:
+            if len(points) < 3:
+                continue
+            pixels = [self.px(point) for point in points]
+            if kind.upper().startswith("I"):
+                surface_draw.polygon(pixels, fill=255)
+            else:
+                surface_draw.polygon(pixels, fill=0)
+
+        if polarity.upper() == "P":
+            # Positive ODB surfaces are a union. A hole in this surface must not
+            # clear positive geometry that came from another independent surface.
+            self.image = ImageChops.lighter(self.image, surface_mask)
+        else:
+            # A negative surface removes exactly its own filled geometry.
+            self.image = ImageChops.subtract(self.image, surface_mask)
         self.draw = ImageDraw.Draw(self.image)
 
 
