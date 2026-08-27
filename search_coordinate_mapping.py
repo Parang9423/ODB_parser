@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Iterable
 
 from PIL import Image, ImageFilter, ImageOps
 
@@ -31,9 +30,6 @@ def _find_reference(g_path: Path) -> Path:
 
 def _candidate_points(x: float, y: float, bounds: list[float]) -> list[tuple[str, float, float, str]]:
     xmin, ymin, xmax, ymax = map(float, bounds)
-    # AOI is expressed as positive distances. Test all corner/orientation conventions
-    # plus raw ODB coordinates. Swap variants cover systems that serialize Y,X or
-    # rotate the panel coordinate frame by 90 degrees.
     return [
         ("DIRECT_XY", x, y, "ODB=(X,Y)"),
         ("DIRECT_YX", y, x, "ODB=(Y,X)"),
@@ -52,7 +48,6 @@ def _binary_edges(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     im = ImageOps.grayscale(image).resize(size, Image.Resampling.BILINEAR)
     im = ImageOps.autocontrast(im)
     edge = im.filter(ImageFilter.FIND_EDGES)
-    # Robust enough for CAM screenshots/JPEGs without requiring numpy/opencv.
     hist = edge.histogram()
     total = sum(hist)
     target = total * 0.82
@@ -72,15 +67,12 @@ def _dice(a: Image.Image, b: Image.Image) -> float:
     na, nb = ha[255], hb[255]
     if na + nb == 0:
         return 0.0
-    both = 0
-    # PIL logical_and avoids another heavyweight dependency.
     from PIL import ImageChops
     both = ImageChops.logical_and(aa, bb).histogram()[255]
     return (2.0 * both) / float(na + nb)
 
 
 def _best_reference_orientation(cam: Image.Image, reference: Image.Image) -> tuple[float, str]:
-    """Score both raw and contrast-inverted C reference; do not rotate geometry."""
     size = cam.size
     cam_edge = _binary_edges(cam, size)
     raw = _binary_edges(reference, size)
@@ -126,7 +118,6 @@ def main() -> int:
                         width_px=args.size, height_px=args.size, signal_gv=255, drill_gv=125,
                     )
                     score, ref_mode = _best_reference_orientation(cam, reference)
-                    # Empty/near-empty CAMs should never win just because the reference has a dark background.
                     if int(meta["final_nonzero_pixels"]) == 0:
                         score = 0.0
                     cam.save(image_out / f"{name}.png")
@@ -134,6 +125,11 @@ def main() -> int:
                         "name": name, "description": description,
                         "odb_x_mm": odb_x, "odb_y_mm": odb_y,
                         "score": round(score, 6), "reference_mode": ref_mode,
+                        "physical_signal_layer": int(meta["physical_signal_layer"]),
+                        "signal_layer": meta["signal_layer"],
+                        "drill_layers_selected": list(meta["drill_layers_considered"]),
+                        "drill_layers_excluded": list(meta["drill_layers_excluded"]),
+                        "drill_layers_rendered": list(meta["drill_layers_rendered"]),
                         "signal_nonzero": int(meta["signal_nonzero_pixels"]),
                         "drill_nonzero": int(meta["drill_nonzero_pixels"]),
                         "final_nonzero": int(meta["final_nonzero_pixels"]),
@@ -153,7 +149,16 @@ def main() -> int:
         })
         top = candidates[0]
         print(f"[{image_no}] {g_path.name}")
-        print(f"    best={top['name']} score={top.get('score', 0):.4f} ODB=({top.get('odb_x_mm'):.3f},{top.get('odb_y_mm'):.3f}) signal={top.get('signal_nonzero','-')} drill={top.get('drill_nonzero','-')}")
+        print(
+            f"    best={top['name']} score={top.get('score', 0):.4f} "
+            f"ODB=({top.get('odb_x_mm'):.3f},{top.get('odb_y_mm'):.3f}) "
+            f"signal={top.get('signal_nonzero','-')} drill={top.get('drill_nonzero','-')}"
+        )
+        if "signal_layer" in top:
+            print(
+                f"    layers: signal={top['signal_layer']} (L{top['physical_signal_layer']}) "
+                f"drill={top['drill_layers_selected']} excluded={top['drill_layers_excluded']}"
+            )
 
     agg_rows = []
     for name, scores in aggregate.items():
