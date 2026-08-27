@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Geometry diagnostics for SIGNAL surfaces inside a small ODB ROI.
+"""Geometry and raster diagnostics for SIGNAL surfaces inside a small ODB ROI.
 
-This module is diagnostic-only.  It does not change production rasterization.
+This module is diagnostic-only. It does not change production rasterization.
 It answers the distinction needed during AOI/CAM calibration:
 - does a SIGNAL surface bounding box merely overlap the ROI?
 - does the actual polygon geometry overlap the ROI?
 - is the ROI centre inside the filled I/H contour geometry?
+- does an individual surface produce pixels before/after hole subtraction?
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from PIL import Image
 
 from hierarchy_renderer import FastODBRenderer
 from odb_cam_renderer import Transform, arc_points
 from render.roi import (
+    FixedRasterCanvas,
     _nonzero_pixels,
     _render_layer_mask,
     roi_bounds_in,
@@ -98,8 +100,8 @@ def _surface_geometry_contains(point: Point, contours: Sequence[tuple[str, Seque
 
 
 def _surface_geometry_intersects(rect: Bounds, contours: Sequence[tuple[str, Sequence[Point]]]) -> bool:
-    # A useful diagnostic rather than a full polygon boolean engine: report overlap
-    # with an island unless the ROI centre is demonstrably inside a hole.
+    # Diagnostic overlap test. It intentionally reports island overlap separately
+    # from hole subtraction so a raster failure can be isolated afterwards.
     islands = [pts for kind, pts in contours if kind.upper().startswith("I")]
     return any(_polygon_rect_intersects(points, rect) for points in islands)
 
@@ -141,6 +143,37 @@ def _parse_surfaces(records: Sequence[str], transform: Transform):
             except (ValueError, IndexError):
                 continue
         yield polarity, contours
+
+
+def _rasterize_surface_decomposition(
+    contours: Sequence[tuple[str, Sequence[Point]]],
+    polarity: str,
+    bounds: Bounds,
+    dpi_x: float,
+    dpi_y: float,
+    width_px: int,
+    height_px: int,
+) -> tuple[Image.Image, Image.Image, Image.Image]:
+    """Render one surface as island-only, hole-only and final I/H result images."""
+    island = FixedRasterCanvas(bounds, dpi_x, dpi_y, width_px, height_px, background=0)
+    holes = FixedRasterCanvas(bounds, dpi_x, dpi_y, width_px, height_px, background=0)
+    final = FixedRasterCanvas(bounds, dpi_x, dpi_y, width_px, height_px, background=0)
+
+    positive = 255 if polarity.upper() == "P" else 0
+    negative = 0 if polarity.upper() == "P" else 255
+
+    for kind, points in contours:
+        if len(points) < 3:
+            continue
+        pixel_points = [final.px(point) for point in points]
+        if kind.upper().startswith("I"):
+            island.draw.polygon([island.px(point) for point in points], fill=255)
+            final.draw.polygon(pixel_points, fill=positive)
+        else:
+            holes.draw.polygon([holes.px(point) for point in points], fill=255)
+            final.draw.polygon(pixel_points, fill=negative)
+
+    return island.image, holes.image, final.image
 
 
 def validate_signal_surfaces(job: Path, center_x_mm: float, center_y_mm: float,
@@ -190,10 +223,10 @@ def validate_signal_surfaces(job: Path, center_x_mm: float, center_y_mm: float,
                     "contours": [
                         {
                             "kind": kind,
-                            "vertices": len(points),
-                            "bbox_mm": [v * 25.4 for v in _bbox(points)] if points else None,
+                            "vertices": len(contour_points),
+                            "bbox_mm": [v * 25.4 for v in _bbox(contour_points)] if contour_points else None,
                         }
-                        for kind, points in contours
+                        for kind, contour_points in contours
                     ],
                 })
 
@@ -207,6 +240,75 @@ def validate_signal_surfaces(job: Path, center_x_mm: float, center_y_mm: float,
         "surface_center_inside_hits": center_hits,
         "surfaces": rows,
     }
+
+
+def render_signal_surface_decomposition(
+    job: Path,
+    center_x_mm: float,
+    center_y_mm: float,
+    resolution_um_per_px: float,
+    recipe_layer: str,
+    width_px: int = 100,
+    height_px: int = 100,
+    visible_steps: Sequence[str] = ("pnl", "strip", "unit"),
+    max_surfaces: int = 12,
+) -> list[dict]:
+    """Return per-surface I/H/final raster images for surfaces overlapping the ROI.
+
+    Each result contains PIL images under island_image, holes_image and final_image;
+    callers should save those images and remove them before serializing metadata.
+    """
+    selection = select_roi_layers(job, recipe_layer)
+    renderer = FastODBRenderer.from_um_per_pixel(job, resolution_um_per_px, resolution_um_per_px)
+    root_step = "pnl" if (job / "steps" / "pnl").is_dir() else next(
+        p.name for p in (job / "steps").iterdir() if p.is_dir()
+    )
+    available = {p.name.lower() for p in (job / "steps").iterdir() if p.is_dir()}
+    visible = {step.lower() for step in visible_steps if step.lower() in available}
+    roi = roi_bounds_in(center_x_mm, center_y_mm, resolution_um_per_px, width_px, height_px)
+    center = (center_x_mm / 25.4, center_y_mm / 25.4)
+
+    results: list[dict] = []
+    surface_index = 0
+    for instance in renderer.collect_instances(root_step):
+        if instance.step not in visible:
+            continue
+        feature_file = renderer._step_dir(instance.step) / "layers" / selection.signal_layer.lower() / "features"
+        _, records = renderer._feature_data(feature_file)
+        if not records:
+            continue
+        for polarity, contours in _parse_surfaces(records, instance.transform):
+            points = [point for _, contour in contours for point in contour]
+            if not points:
+                continue
+            surface_bbox = _bbox(points)
+            if not _bbox_intersects(surface_bbox, roi):
+                continue
+            if len(results) >= max_surfaces:
+                return results
+
+            island_img, holes_img, final_img = _rasterize_surface_decomposition(
+                contours, polarity, roi, renderer.dpi_x, renderer.dpi_y, width_px, height_px
+            )
+            results.append({
+                "surface_index": surface_index,
+                "step": instance.step.upper(),
+                "polarity": polarity,
+                "bbox_mm": [v * 25.4 for v in surface_bbox],
+                "actual_polygon_intersects_roi": _surface_geometry_intersects(roi, contours),
+                "roi_center_inside_filled_geometry": _surface_geometry_contains(center, contours),
+                "island_nonzero_pixels": _nonzero_pixels(island_img),
+                "holes_nonzero_pixels": _nonzero_pixels(holes_img),
+                "final_nonzero_pixels": _nonzero_pixels(final_img),
+                "contour_count": len(contours),
+                "island_contours": sum(1 for kind, _ in contours if kind.upper().startswith("I")),
+                "hole_contours": sum(1 for kind, _ in contours if kind.upper().startswith("H")),
+                "island_image": island_img,
+                "holes_image": holes_img,
+                "final_image": final_img,
+            })
+            surface_index += 1
+    return results
 
 
 def render_signal_preview(job: Path, center_x_mm: float, center_y_mm: float,
