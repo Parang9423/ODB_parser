@@ -25,7 +25,7 @@ jobs:
             validate_coordinates.py generate_cam_crops.py compare_full_render_crop.py search_coordinate_mapping.py \
             aoi/__init__.py aoi/ert.py aoi/coordinate_validation.py \
             alignment/__init__.py alignment/guide_drill.py \
-            render/__init__.py render/hierarchy.py render/composite.py render/roi.py \
+            render/__init__.py render/hierarchy.py render/composite.py render/roi.py render/surface_validation.py \
             ui/__init__.py ui/defaults.py ui/platform.py ui/layer_dialog.py ui/main_window.py
       - name: Test
         run: python -m pytest -q
