@@ -4,6 +4,11 @@
 The renderer draws only the requested physical window instead of rasterizing the
 whole panel. SIGNAL features are rendered at GV 255 and drill-like features at
 GV 125 by default. PNL/STRIP/UNIT hierarchy transforms are still applied.
+
+Layer selection is based on physical layer identity, not product-specific names:
+- AOI L1 / L1-TU / L1_TD all mean physical signal layer 1.
+- Drill names such as DLD_1-2 or TH_1-4 are selected only when their layer span
+  contains the current signal layer.
 """
 from __future__ import annotations
 
@@ -22,8 +27,10 @@ from odb_cam_renderer import RasterCanvas, Transform
 
 @dataclass(frozen=True)
 class ROILayerSelection:
+    physical_signal_layer: int
     signal_layer: str
     drill_layers: tuple[str, ...]
+    excluded_drill_layers: tuple[str, ...] = ()
 
 
 class FixedRasterCanvas(RasterCanvas):
@@ -55,71 +62,95 @@ def roi_bounds_in(center_x_mm: float, center_y_mm: float, resolution_um_per_px: 
 
 
 def _recipe_tokens(recipe_layer: str) -> tuple[str | None, str | None]:
-    """Extract only the useful AOI layer identity tokens.
-
-    Example: L1-TU-11-T-025 -> ("L1", "TU").
-    The trailing recipe/spec tokens are intentionally ignored.
-    """
     parts = [part for part in re.split(r"[-_]+", recipe_layer.strip().upper()) if part]
     layer_no = next((part for part in parts if re.fullmatch(r"L\d+", part)), None)
     orientation = next((part for part in parts if part in {"TU", "TD", "BU", "BD"}), None)
     return layer_no, orientation
 
 
+def _physical_layer_number(value: str) -> int | None:
+    match = re.search(r"(?:^|[-_])L(\d+)(?=$|[-_])", value.strip().upper())
+    if match:
+        return int(match.group(1))
+    match = re.match(r"^L(\d+)(?:\D|$)", value.strip().upper())
+    return int(match.group(1)) if match else None
+
+
 def _normalized_layer_parts(name: str) -> set[str]:
     return {part for part in re.split(r"[-_]+", name.strip().upper()) if part}
 
 
-def select_roi_layers(job: Path, recipe_layer: str) -> ROILayerSelection:
-    """Map AOI recipe layer to ODB SIGNAL layer.
+def _drill_layer_span(name: str) -> tuple[int, int] | None:
+    """Parse connected physical-layer span from DLD_1-2 / TH_1-4 style names."""
+    text = name.strip().upper()
+    matches = list(re.finditer(r"(?<!\d)(\d+)\s*[-_]\s*(\d+)(?!\d)", text))
+    if not matches:
+        return None
+    a, b = int(matches[-1].group(1)), int(matches[-1].group(2))
+    return min(a, b), max(a, b)
 
-    The AOI physical layer number is authoritative. For example,
-    L1-TU-11-T-025 must map only to an ODB SIGNAL layer whose normalized
-    name contains L1. TU/TD/BU/BD is used only to disambiguate multiple
-    candidates with the same layer number; it must never cause fallback to
-    another physical layer such as L2.
-    """
+
+def _span_contains(span: tuple[int, int] | None, physical_layer: int) -> bool:
+    return span is not None and span[0] <= physical_layer <= span[1]
+
+
+def select_roi_layers(job: Path, recipe_layer: str) -> ROILayerSelection:
+    """Select SIGNAL and DRILL layers using physical layer number as authority."""
     info = inspect_job(job)
     signal_layers = [layer for layer in info.layers if layer.layer_type.upper() == "SIGNAL"]
     if not signal_layers:
         raise ValueError("ODB Matrix contains no SIGNAL layer")
 
-    layer_no, orientation = _recipe_tokens(recipe_layer)
-    if not layer_no:
+    layer_token, orientation = _recipe_tokens(recipe_layer)
+    if not layer_token:
         raise ValueError(f"Could not extract physical layer number from AOI layer {recipe_layer!r}")
+    physical_layer = int(layer_token[1:])
 
-    by_layer = [
-        layer.name for layer in signal_layers
-        if layer_no in _normalized_layer_parts(layer.name) or layer.name.upper() == layer_no
-    ]
-
+    by_layer = [layer.name for layer in signal_layers if _physical_layer_number(layer.name) == physical_layer]
     if not by_layer:
         names = ", ".join(layer.name for layer in signal_layers)
         raise ValueError(
-            f"No ODB SIGNAL layer matches AOI physical layer {layer_no!r} from {recipe_layer!r}. "
+            f"No ODB SIGNAL layer matches AOI physical layer L{physical_layer} from {recipe_layer!r}. "
             f"Refusing to fall back to another physical layer. SIGNAL layers=[{names}]"
         )
 
     if len(by_layer) == 1:
         selected = by_layer[0]
-    else:
-        if orientation:
-            oriented = [name for name in by_layer if orientation in _normalized_layer_parts(name)]
-            if len(oriented) == 1:
-                selected = oriented[0]
-            else:
-                raise ValueError(
-                    f"Multiple ODB SIGNAL layers match physical layer {layer_no!r}, but orientation "
-                    f"{orientation!r} is not unique. Candidates={by_layer}"
-                )
+    elif orientation:
+        oriented = [name for name in by_layer if orientation in _normalized_layer_parts(name)]
+        if len(oriented) == 1:
+            selected = oriented[0]
         else:
             raise ValueError(
-                f"Multiple ODB SIGNAL layers match physical layer {layer_no!r} and AOI recipe has no "
+                f"Multiple ODB SIGNAL layers match physical layer L{physical_layer}, but orientation "
+                f"{orientation!r} is not unique. Candidates={by_layer}"
+            )
+    else:
+        bare = [name for name in by_layer if name.strip().upper() == f"L{physical_layer}"]
+        if len(bare) == 1:
+            selected = bare[0]
+        else:
+            raise ValueError(
+                f"Multiple ODB SIGNAL layers match physical layer L{physical_layer} and AOI recipe has no "
                 f"orientation discriminator. Candidates={by_layer}"
             )
 
-    drills = tuple(layer.name for layer in info.layers if is_drill_layer(layer))
-    return ROILayerSelection(signal_layer=selected, drill_layers=drills)
+    included_drills: list[str] = []
+    excluded_drills: list[str] = []
+    for layer in info.layers:
+        if not is_drill_layer(layer):
+            continue
+        if _span_contains(_drill_layer_span(layer.name), physical_layer):
+            included_drills.append(layer.name)
+        else:
+            excluded_drills.append(layer.name)
+
+    return ROILayerSelection(
+        physical_signal_layer=physical_layer,
+        signal_layer=selected,
+        drill_layers=tuple(included_drills),
+        excluded_drill_layers=tuple(excluded_drills),
+    )
 
 
 def _render_layer_mask(renderer: FastODBRenderer, root_step: str, layer: str,
@@ -186,10 +217,12 @@ def render_roi_cam(job: Path, center_x_mm: float, center_y_mm: float, resolution
         "size_px": [width_px, height_px],
         "physical_size_mm": [width_px * resolution_um_per_px / 1000.0, height_px * resolution_um_per_px / 1000.0],
         "roi_bounds_mm": [xmin * 25.4, ymin * 25.4, xmax * 25.4, ymax * 25.4],
+        "physical_signal_layer": selection.physical_signal_layer,
         "signal_layer": selection.signal_layer,
         "signal_gv": signal_gv,
         "signal_nonzero_pixels": signal_nonzero,
         "drill_layers_considered": list(selection.drill_layers),
+        "drill_layers_excluded": list(selection.excluded_drill_layers),
         "drill_layers_rendered": used_drills,
         "drill_layer_nonzero_pixels": drill_layer_nonzero,
         "drill_nonzero_pixels": drill_nonzero,
