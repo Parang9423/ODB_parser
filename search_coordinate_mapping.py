@@ -6,9 +6,9 @@ Important calibration rule:
 - C reference CAM images use the same centre and physical resolution but are
   normally 200x200.
 
-Therefore C images must never be resized to 100x100 for comparison.  Each ODB
+Therefore C images must never be resized to 100x100 for comparison. Each ODB
 candidate is rendered once at the requested G crop size and once at the native C
-reference size.  The native-size render is used for similarity ranking.
+reference size. The native-size render is used for similarity ranking.
 """
 from __future__ import annotations
 
@@ -20,7 +20,11 @@ from PIL import Image, ImageFilter, ImageOps
 
 from odb_cam_renderer import extract_input
 from render.roi import render_roi_cam
-from render.surface_validation import render_signal_preview, validate_signal_surfaces
+from render.surface_validation import (
+    render_signal_preview,
+    render_signal_surface_decomposition,
+    validate_signal_surfaces,
+)
 
 
 def _find_reference(g_path: Path) -> Path:
@@ -66,8 +70,6 @@ def _center_crop_or_pad(image: Image.Image, width: int, height: int) -> Image.Im
 def _binary_edges(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     im = ImageOps.grayscale(image)
     if im.size != size:
-        # Used only as a guard for unusual reference sizes.  Normal calibration
-        # paths render ODB directly at the native C image dimensions.
         im = im.resize(size, Image.Resampling.BILINEAR)
     im = ImageOps.autocontrast(im)
     edge = im.filter(ImageFilter.FIND_EDGES)
@@ -142,6 +144,30 @@ def _save_reference_size_components(candidate_dir: Path, cam: Image.Image, compo
     return {key: str(value) for key, value in paths.items()}
 
 
+def _save_surface_decomposition(candidate_dir: Path, surfaces: list[dict]) -> list[dict]:
+    """Save per-surface ISLAND/HOLES/FINAL images and return JSON-safe metadata."""
+    surface_dir = candidate_dir / "surface_debug"
+    surface_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    for ordinal, item in enumerate(surfaces):
+        prefix = f"SURFACE_{ordinal:02d}_{item['step']}"
+        island_path = surface_dir / f"{prefix}_ISLAND.png"
+        holes_path = surface_dir / f"{prefix}_HOLES.png"
+        final_path = surface_dir / f"{prefix}_FINAL.png"
+        item["island_image"].save(island_path)
+        item["holes_image"].save(holes_path)
+        item["final_image"].save(final_path)
+        rows.append({
+            key: value for key, value in item.items()
+            if key not in {"island_image", "holes_image", "final_image"}
+        } | {
+            "island_image": str(island_path),
+            "holes_image": str(holes_path),
+            "final_image": str(final_path),
+        })
+    return rows
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Search AOI->ODB coordinate conventions using native-size C CAM references")
     ap.add_argument("validation_json", type=Path)
@@ -149,6 +175,7 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=5, help="Number of G/C pairs to test")
     ap.add_argument("--size", type=int, default=100, help="Output size required for G inference crop")
     ap.add_argument("--wide-signal-size", type=int, default=500, help="Diagnostic SIGNAL-only preview size")
+    ap.add_argument("--surface-debug-limit", type=int, default=12, help="Max intersecting SIGNAL surfaces to decompose")
     args = ap.parse_args()
 
     payload = json.loads(args.validation_json.resolve().read_text(encoding="utf-8"))
@@ -179,7 +206,6 @@ def main() -> int:
         try:
             for name, odb_x, odb_y, description in _candidate_points(x, y, bounds):
                 try:
-                    # Required production/G size.
                     cam, meta, components = render_roi_cam(
                         job, odb_x, odb_y, resolution, str(info["layer"]),
                         width_px=args.size, height_px=args.size, signal_gv=255, drill_gv=125,
@@ -187,8 +213,6 @@ def main() -> int:
                     )
                     candidate_dir, output_files = _save_candidate_components(image_out, name, cam, components)
 
-                    # Native C reference size (normally 200x200). Same centre and same
-                    # resolution means this is the only physically valid direct comparison.
                     cam_ref, meta_ref, components_ref = render_roi_cam(
                         job, odb_x, odb_y, resolution, str(info["layer"]),
                         width_px=reference_size[0], height_px=reference_size[1],
@@ -203,6 +227,14 @@ def main() -> int:
                         job, odb_x, odb_y, resolution, str(info["layer"]),
                         width_px=args.size, height_px=args.size,
                     )
+                    surface_debug_raw = render_signal_surface_decomposition(
+                        job, odb_x, odb_y, resolution, str(info["layer"]),
+                        width_px=args.size, height_px=args.size,
+                        max_surfaces=args.surface_debug_limit,
+                    )
+                    surface_debug = _save_surface_decomposition(candidate_dir, surface_debug_raw)
+                    output_files["surface_debug_dir"] = str(candidate_dir / "surface_debug")
+
                     wide_signal, wide_meta = render_signal_preview(
                         job, odb_x, odb_y, resolution, str(info["layer"]),
                         width_px=args.wide_signal_size, height_px=args.wide_signal_size,
@@ -211,7 +243,6 @@ def main() -> int:
                     wide_signal.save(wide_path)
                     output_files["signal_wide"] = str(wide_path)
 
-                    # Keep old flat 100x100 composite for quick browsing.
                     cam.save(image_out / f"{name}.png")
                     row = {
                         "name": name, "description": description,
@@ -234,6 +265,7 @@ def main() -> int:
                         "reference_size_final_nonzero": int(meta_ref["final_nonzero_pixels"]),
                         "wide_signal": wide_meta,
                         "surface_validation": surface_validation,
+                        "surface_raster_decomposition": surface_debug,
                         "output_files": output_files,
                         "feature_diagnostics": meta.get("feature_diagnostics", {}),
                     }
@@ -264,9 +296,7 @@ def main() -> int:
         })
         top = candidates[0]
         print(f"[{image_no}] {g_path.name}")
-        print(
-            f"    C reference={reference_size[0]}x{reference_size[1]} px; G target={args.size}x{args.size} px; no resize"
-        )
+        print(f"    C reference={reference_size[0]}x{reference_size[1]} px; G target={args.size}x{args.size} px; no resize")
         print(
             f"    best={top['name']} score={top.get('score', 0):.4f} "
             f"ODB=({top.get('odb_x_mm'):.3f},{top.get('odb_y_mm'):.3f}) "
@@ -283,6 +313,14 @@ def main() -> int:
                 f"polygon_hits={surface.get('surface_actual_polygon_hits',0)} "
                 f"center_inside={surface.get('surface_center_inside_hits',0)}"
             )
+            debug_rows = top.get("surface_raster_decomposition", [])
+            if debug_rows:
+                summary = [
+                    f"#{r['surface_index']}:{r['step']} I={r['island_nonzero_pixels']} "
+                    f"H={r['holes_nonzero_pixels']} F={r['final_nonzero_pixels']}"
+                    for r in debug_rows
+                ]
+                print(f"    surface raster: {'; '.join(summary)}")
             print(
                 f"    wide SIGNAL {args.wide_signal_size}px nonzero="
                 f"{top.get('wide_signal',{}).get('nonzero_pixels','-')}"
