@@ -9,10 +9,6 @@ Layer selection is based on physical layer identity, not product-specific names:
 - AOI L1 / L1-TU / L1_TD all mean physical signal layer 1.
 - Drill names such as DLD_1-2 or TH_1-4 are selected only when their layer span
   contains the current signal layer.
-
-For debugging, ``return_components=True`` returns SIGNAL-only and DRILL-only
-rasters plus per-layer primitive/symbol-size diagnostics. This is useful for
-separating coordinate errors from ODB symbol/raster interpretation errors.
 """
 from __future__ import annotations
 
@@ -184,9 +180,9 @@ def _feature_diagnostics(renderer: FastODBRenderer, root_step: str, layer: str,
                          resolution_um_per_px: float, max_samples: int = 20) -> dict:
     """Inspect primitives whose transformed geometry intersects the ROI.
 
-    This does not replace the rasterizer. It records raw ODB symbol strings and
-    the renderer's interpreted physical/pixel dimensions so scale errors can be
-    diagnosed independently of coordinate matching.
+    Diagnostics must never break rendering merely because an ODB symbol is not
+    supported by the rasterizer. Unsupported pad symbols are treated as point
+    bboxes for ROI membership and recorded separately.
     """
     visible = {str(step).lower() for step in visible_steps}
     roi = tuple(map(float, bounds))
@@ -220,15 +216,16 @@ def _feature_diagnostics(renderer: FastODBRenderer, root_step: str, layer: str,
                     center = instance.transform.apply((x, y))
                     if parsed is not None:
                         kind, width_in, height_in = parsed
-                        half_w, half_h = width_in / 2.0, height_in / 2.0
                     else:
                         kind, width_in, height_in = "unsupported", 0.0, 0.0
+                    half_w, half_h = width_in / 2.0, height_in / 2.0
                     bbox = (center[0] - half_w, center[1] - half_h, center[0] + half_w, center[1] + half_h)
                     if _bbox_intersects(bbox, roi):
                         counts["pads"] += 1
-                        symbol_counts[symbol or f"#{symbol_id}"] = symbol_counts.get(symbol or f"#{symbol_id}", 0) + 1
+                        key = symbol or f"#{symbol_id}"
+                        symbol_counts[key] = symbol_counts.get(key, 0) + 1
                         if parsed is None:
-                            unsupported_symbols[symbol or f"#{symbol_id}"] = unsupported_symbols.get(symbol or f"#{symbol_id}", 0) + 1
+                            unsupported_symbols[key] = unsupported_symbols.get(key, 0) + 1
                         if len(samples) < max_samples:
                             samples.append({
                                 "step": instance.step.upper(), "type": "PAD", "polarity": polarity,
@@ -248,9 +245,10 @@ def _feature_diagnostics(renderer: FastODBRenderer, root_step: str, layer: str,
                             max(p1[0], p2[0]) + diameter / 2, max(p1[1], p2[1]) + diameter / 2)
                     if _bbox_intersects(bbox, roi):
                         counts["lines"] += 1
-                        symbol_counts[symbol or f"#{symbol_id}"] = symbol_counts.get(symbol or f"#{symbol_id}", 0) + 1
+                        key = symbol or f"#{symbol_id}"
+                        symbol_counts[key] = symbol_counts.get(key, 0) + 1
                         if parsed is None:
-                            unsupported_symbols[symbol or f"#{symbol_id}"] = unsupported_symbols.get(symbol or f"#{symbol_id}", 0) + 1
+                            unsupported_symbols[key] = unsupported_symbols.get(key, 0) + 1
                         if len(samples) < max_samples:
                             samples.append({
                                 "step": instance.step.upper(), "type": "LINE", "polarity": polarity,
