@@ -3,8 +3,9 @@
 
 For each G_<Y>_<X>_<idx> validation item, find the matching C_ image, render a
 100x100 ODB SIGNAL+DRILL ROI for several coordinate conventions, and rank the
-candidates by simple structural similarity. This is a diagnostic: it does not
-silently change the production coordinate mapping.
+candidates by simple structural similarity. Each candidate also saves SIGNAL-only
+and DRILL-only images plus symbol/primitive diagnostics so raster interpretation
+can be checked independently of coordinate matching.
 """
 from __future__ import annotations
 
@@ -81,6 +82,30 @@ def _best_reference_orientation(cam: Image.Image, reference: Image.Image) -> tup
     return (s_raw, "normal") if s_raw >= s_inv else (s_inv, "inverted")
 
 
+def _save_candidate_components(image_out: Path, name: str, cam: Image.Image, components: dict) -> dict:
+    candidate_dir = image_out / name
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "composite": candidate_dir / "COMPOSITE.png",
+        "signal_only": candidate_dir / "SIGNAL_ONLY.png",
+        "drill_only": candidate_dir / "DRILL_ONLY.png",
+        "signal_mask": candidate_dir / "SIGNAL_MASK.png",
+        "drill_mask": candidate_dir / "DRILL_MASK.png",
+    }
+    cam.save(paths["composite"])
+    components["signal"].save(paths["signal_only"])
+    components["drill"].save(paths["drill_only"])
+    components["signal_mask"].save(paths["signal_mask"])
+    components["drill_mask"].save(paths["drill_mask"])
+    drill_layer_paths = {}
+    for layer, mask in components.get("drill_layer_masks", {}).items():
+        safe = layer.replace("/", "_").replace("\\", "_")
+        path = candidate_dir / f"DRILL_{safe}_MASK.png"
+        mask.save(path)
+        drill_layer_paths[layer] = str(path)
+    return {key: str(value) for key, value in paths.items()} | {"drill_layer_masks": drill_layer_paths}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Search AOI->ODB coordinate conventions using C_ CAM images as reference")
     ap.add_argument("validation_json", type=Path)
@@ -113,13 +138,16 @@ def main() -> int:
         try:
             for name, odb_x, odb_y, description in _candidate_points(x, y, bounds):
                 try:
-                    cam, meta = render_roi_cam(
+                    cam, meta, components = render_roi_cam(
                         job, odb_x, odb_y, resolution, str(info["layer"]),
                         width_px=args.size, height_px=args.size, signal_gv=255, drill_gv=125,
+                        return_components=True,
                     )
                     score, ref_mode = _best_reference_orientation(cam, reference)
                     if int(meta["final_nonzero_pixels"]) == 0:
                         score = 0.0
+                    output_files = _save_candidate_components(image_out, name, cam, components)
+                    # Keep the old flat composite too for quick visual browsing.
                     cam.save(image_out / f"{name}.png")
                     row = {
                         "name": name, "description": description,
@@ -133,7 +161,13 @@ def main() -> int:
                         "signal_nonzero": int(meta["signal_nonzero_pixels"]),
                         "drill_nonzero": int(meta["drill_nonzero_pixels"]),
                         "final_nonzero": int(meta["final_nonzero_pixels"]),
+                        "output_files": output_files,
+                        "feature_diagnostics": meta.get("feature_diagnostics", {}),
                     }
+                    candidate_dir = image_out / name
+                    (candidate_dir / "render_detail.json").write_text(
+                        json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
                     candidates.append(row); aggregate.setdefault(name, []).append(score)
                 except Exception as exc:
                     candidates.append({"name": name, "description": description, "odb_x_mm": odb_x, "odb_y_mm": odb_y, "error": f"{type(exc).__name__}: {exc}", "score": 0.0})
@@ -159,6 +193,16 @@ def main() -> int:
                 f"    layers: signal={top['signal_layer']} (L{top['physical_signal_layer']}) "
                 f"drill={top['drill_layers_selected']} excluded={top['drill_layers_excluded']}"
             )
+            signal_diag = top.get("feature_diagnostics", {}).get("signal", {})
+            counts = signal_diag.get("roi_primitive_counts", {})
+            print(
+                f"    signal primitives: P={counts.get('pads',0)} L={counts.get('lines',0)} S={counts.get('surfaces',0)}"
+            )
+            drill_diags = top.get("feature_diagnostics", {}).get("drill", {})
+            drill_counts = {
+                layer: diag.get("roi_primitive_counts", {}) for layer, diag in drill_diags.items()
+            }
+            print(f"    drill primitives: {drill_counts}")
 
     agg_rows = []
     for name, scores in aggregate.items():
