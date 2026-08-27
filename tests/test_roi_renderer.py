@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from render.roi import roi_bounds_in, select_roi_layers
+from render.roi import _bbox_intersects, roi_bounds_in, select_roi_layers
 
 
 def _write_matrix(job: Path, body: str) -> None:
@@ -44,10 +44,26 @@ CONTEXT=BOARD
 SIDE=NONE
 POLARITY=POSITIVE
 }
+LAYER {
+NAME=TH_1-4
+TYPE=DRILL
+CONTEXT=BOARD
+SIDE=NONE
+POLARITY=POSITIVE
+}
+LAYER {
+NAME=DLD_2-3
+TYPE=DRILL
+CONTEXT=BOARD
+SIDE=NONE
+POLARITY=POSITIVE
+}
 """)
     selected = select_roi_layers(job, "L1-TU-11-T-025")
+    assert selected.physical_signal_layer == 1
     assert selected.signal_layer == "L1"
-    assert selected.drill_layers == ("DLD_1-2",)
+    assert selected.drill_layers == ("DLD_1-2", "TH_1-4")
+    assert selected.excluded_drill_layers == ("DLD_2-3",)
 
 
 def test_select_roi_layers_never_falls_back_to_other_physical_layer(tmp_path: Path):
@@ -99,3 +115,9 @@ POLARITY=POSITIVE
 """)
     selected = select_roi_layers(job, "L1-TU-11-T-025")
     assert selected.signal_layer == "L1_TU"
+
+
+def test_bbox_intersection_used_by_feature_diagnostics():
+    roi = (0.0, 0.0, 1.0, 1.0)
+    assert _bbox_intersects((0.9, 0.9, 1.2, 1.2), roi)
+    assert not _bbox_intersects((1.1, 1.1, 2.0, 2.0), roi)
