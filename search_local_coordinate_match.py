@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 """Coarse-to-fine AOI(panel-mm) -> ODB coordinate search using C_ CAM references.
 
-The filename X/Y values are treated as panel physical millimetres.  They are the
-initial search centre, not pixels and not a corner-normalised coordinate.
-
-For each G/C pair the tool:
-1. reads AOI X/Y mm from coordinate_validation.json,
-2. uses that panel-mm point as the initial ODB search centre,
-3. performs a configurable coarse-to-fine local search,
-4. renders only the native C reference size (normally 200x200),
-5. keeps only REFERENCE_C.png, BEST_CAM.png and compact JSON metadata.
-
-No SIGNAL-only, DRILL-only, mask, surface-debug or 100x100 production render is
-created here.  This tool is strictly for coordinate calibration.
+Filename X/Y values are treated as panel physical millimetres and used as the
+initial search centre. This tool is intentionally lightweight: it renders only
+native C-reference-sized final composites and keeps only the reference, final
+best CAM and compact JSON metadata.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -56,7 +49,6 @@ def _binary_edges(image: Image.Image) -> Image.Image:
 
 def _dice(a: Image.Image, b: Image.Image) -> float:
     from PIL import ImageChops
-
     aa, bb = a.convert("1"), b.convert("1")
     ha, hb = aa.histogram(), bb.histogram()
     na, nb = ha[255], hb[255]
@@ -77,28 +69,21 @@ def _axis_offsets(radius_mm: float, step_mm: float) -> list[float]:
         raise ValueError("radius must be >= 0 and step must be > 0")
     count = int(math.floor(radius_mm / step_mm + 1e-9))
     values = [i * step_mm for i in range(-count, count + 1)]
-    # Keep the exact radius boundary when radius is not an integer multiple of step.
     if radius_mm > 0 and (not values or abs(values[0] + radius_mm) > 1e-9):
         values.insert(0, -radius_mm)
     if radius_mm > 0 and abs(values[-1] - radius_mm) > 1e-9:
         values.append(radius_mm)
-    # Stable unique values after floating-point construction.
     return sorted({round(v, 9) for v in values})
 
 
-def _grid(center_x: float, center_y: float, radius_mm: float, step_mm: float) -> Iterable[tuple[float, float]]:
+def _grid(center_x: float, center_y: float, radius_mm: float, step_mm: float) -> list[tuple[float, float]]:
     offsets = _axis_offsets(radius_mm, step_mm)
-    for dy in offsets:
-        for dx in offsets:
-            yield center_x + dx, center_y + dy
+    return [(center_x + dx, center_y + dy) for dy in offsets for dx in offsets]
 
 
-def _inside_panel(x_mm: float, y_mm: float, bounds_mm: list[float], margin_mm: float = 0.0) -> bool:
+def _inside_panel(x_mm: float, y_mm: float, bounds_mm: list[float]) -> bool:
     xmin, ymin, xmax, ymax = map(float, bounds_mm)
-    return (
-        xmin - margin_mm <= x_mm <= xmax + margin_mm
-        and ymin - margin_mm <= y_mm <= ymax + margin_mm
-    )
+    return xmin <= x_mm <= xmax and ymin <= y_mm <= ymax
 
 
 def _parse_levels(values: list[str]) -> list[tuple[float, float]]:
@@ -117,6 +102,15 @@ def _parse_levels(values: list[str]) -> list[tuple[float, float]]:
     return levels
 
 
+def _fmt_seconds(value: float) -> str:
+    value = max(0.0, float(value))
+    if value < 60:
+        return f"{value:.0f}s"
+    if value < 3600:
+        return f"{value / 60:.1f}m"
+    return f"{value / 3600:.2f}h"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Search ODB coordinates around AOI panel-mm coordinates")
     parser.add_argument("validation_json", type=Path)
@@ -124,11 +118,16 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=1, help="Number of G/C pairs to search")
     parser.add_argument(
         "--level", action="append", default=None, metavar="RADIUS:STEP",
-        help="Search level in mm. Repeat for coarse-to-fine search. Default: 10:2, 2:0.5, 0.5:0.1, 0.1:0.02",
+        help=("Search level in mm. Repeat for coarse-to-fine search. "
+              "Default: 10:5, 2:1, 0.5:0.25, 0.1:0.05"),
     )
+    parser.add_argument("--progress-every", type=int, default=1, help="Print progress every N tested candidates")
     args = parser.parse_args()
 
-    levels = _parse_levels(args.level or ["10:2", "2:0.5", "0.5:0.1", "0.1:0.02"])
+    # Previous defaults required 444 full CAM renders per image. These defaults
+    # keep the same coarse-to-fine intent but reduce the search to about 100
+    # renders per image before panel-boundary skips.
+    levels = _parse_levels(args.level or ["10:5", "2:1", "0.5:0.25", "0.1:0.05"])
     payload = json.loads(args.validation_json.resolve().read_text(encoding="utf-8"))
     details = list(payload.get("results", []))[: max(1, args.limit)]
     if not details:
@@ -136,6 +135,7 @@ def main() -> int:
 
     output_root = args.output.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    report_path = output_root / "local_coordinate_search.json"
     report = {
         "coordinate_assumption": "filename X/Y are panel physical millimetres and are used as the initial search centre",
         "search_levels_mm": [{"radius": r, "step": s} for r, s in levels],
@@ -143,6 +143,7 @@ def main() -> int:
     }
 
     for image_no, detail in enumerate(details, 1):
+        image_started = time.perf_counter()
         info, resources, ert = detail["image_context"], detail["resources"], detail["ert"]
         g_path = Path(info["image_path"])
         c_path = _find_reference(g_path)
@@ -159,6 +160,11 @@ def main() -> int:
         reference.save(reference_path)
         reference_edges = _binary_edges(reference)
 
+        print(f"[{image_no}] {g_path.name}", flush=True)
+        print(f"    AOI panel mm : X={aoi_x:.6f}, Y={aoi_y:.6f}", flush=True)
+        print(f"    reference    : {reference.width}x{reference.height}px @ {resolution:g} um/px", flush=True)
+        print(f"    levels       : {levels}", flush=True)
+
         job, temp_dir = extract_input(Path(resources["odb_path"]))
         current_x, current_y = aoi_x, aoi_y
         best_cam: Image.Image | None = None
@@ -167,29 +173,30 @@ def main() -> int:
         stages: list[dict] = []
         try:
             for stage_no, (radius, step) in enumerate(levels, 1):
+                stage_started = time.perf_counter()
+                center_in = (current_x, current_y)
+                candidates = [p for p in _grid(current_x, current_y, radius, step) if _inside_panel(p[0], p[1], panel_bounds)]
+                total = len(candidates)
+                if total == 0:
+                    raise RuntimeError(f"Search stage {stage_no} produced no in-panel candidates")
+
+                print(
+                    f"    stage {stage_no}/{len(levels)}: center=({current_x:.3f},{current_y:.3f}) "
+                    f"radius={radius:g}mm step={step:g}mm candidates={total}",
+                    flush=True,
+                )
+
                 stage_best_score = -1.0
                 stage_best_x, stage_best_y = current_x, current_y
                 stage_best_cam: Image.Image | None = None
                 stage_best_meta: dict | None = None
-                tested = 0
-                skipped_outside_panel = 0
 
-                for candidate_x, candidate_y in _grid(current_x, current_y, radius, step):
-                    if not _inside_panel(candidate_x, candidate_y, panel_bounds):
-                        skipped_outside_panel += 1
-                        continue
-                    tested += 1
+                for idx, (candidate_x, candidate_y) in enumerate(candidates, 1):
+                    candidate_started = time.perf_counter()
                     cam, meta = render_roi_cam(
-                        job,
-                        candidate_x,
-                        candidate_y,
-                        resolution,
-                        str(info["layer"]),
-                        width_px=reference.width,
-                        height_px=reference.height,
-                        signal_gv=255,
-                        drill_gv=125,
-                        return_components=False,
+                        job, candidate_x, candidate_y, resolution, str(info["layer"]),
+                        width_px=reference.width, height_px=reference.height,
+                        signal_gv=255, drill_gv=125, return_components=False,
                     )
                     score = _score(cam, reference_edges) if int(meta["final_nonzero_pixels"]) else 0.0
                     if score > stage_best_score:
@@ -198,26 +205,53 @@ def main() -> int:
                         stage_best_cam = cam.copy()
                         stage_best_meta = dict(meta)
 
-                if stage_best_cam is None:
-                    raise RuntimeError(f"Search stage {stage_no} produced no in-panel candidates")
+                    elapsed = time.perf_counter() - stage_started
+                    avg = elapsed / idx
+                    eta = avg * (total - idx)
+                    if idx == 1 or idx == total or idx % max(1, args.progress_every) == 0:
+                        print(
+                            f"      {idx:>3}/{total} ({idx / total:>6.1%}) "
+                            f"xy=({candidate_x:.3f},{candidate_y:.3f}) score={score:.4f} "
+                            f"best={stage_best_score:.4f} last={_fmt_seconds(time.perf_counter()-candidate_started)} "
+                            f"elapsed={_fmt_seconds(elapsed)} ETA={_fmt_seconds(eta)}",
+                            flush=True,
+                        )
+
+                if stage_best_cam is None or stage_best_meta is None:
+                    raise RuntimeError(f"Search stage {stage_no} did not produce a result")
 
                 current_x, current_y = stage_best_x, stage_best_y
                 best_score = stage_best_score
                 best_cam = stage_best_cam
                 best_meta = stage_best_meta
-                stages.append({
+                stage_row = {
                     "stage": stage_no,
                     "radius_mm": radius,
                     "step_mm": step,
-                    "search_center_input_mm": [
-                        aoi_x if stage_no == 1 else stages[-1]["best_odb_mm"][0],
-                        aoi_y if stage_no == 1 else stages[-1]["best_odb_mm"][1],
-                    ],
-                    "tested_candidates": tested,
-                    "skipped_outside_panel": skipped_outside_panel,
+                    "search_center_input_mm": [center_in[0], center_in[1]],
+                    "tested_candidates": total,
                     "best_odb_mm": [stage_best_x, stage_best_y],
                     "best_score": round(stage_best_score, 6),
-                })
+                    "elapsed_seconds": round(time.perf_counter() - stage_started, 3),
+                }
+                stages.append(stage_row)
+                print(
+                    f"    stage {stage_no} best: ({current_x:.6f},{current_y:.6f}) "
+                    f"score={best_score:.6f} elapsed={_fmt_seconds(stage_row['elapsed_seconds'])}",
+                    flush=True,
+                )
+
+                # Preserve useful work even if a later stage is interrupted.
+                interim = {
+                    "status": "running",
+                    "g_image": str(g_path),
+                    "aoi_panel_mm": [aoi_x, aoi_y],
+                    "current_best_odb_mm": [current_x, current_y],
+                    "current_best_score": round(best_score, 6),
+                    "completed_stages": stages,
+                }
+                (image_dir / "INTERIM.json").write_text(json.dumps(interim, ensure_ascii=False, indent=2), encoding="utf-8")
+                best_cam.save(image_dir / "BEST_CAM_INTERIM.png")
         finally:
             if temp_dir is not None:
                 temp_dir.cleanup()
@@ -247,20 +281,19 @@ def main() -> int:
             "drill_nonzero": int(best_meta["drill_nonzero_pixels"]),
             "final_nonzero": int(best_meta["final_nonzero_pixels"]),
             "panel_bounds_mm": panel_bounds,
+            "elapsed_seconds": round(time.perf_counter() - image_started, 3),
             "stages": stages,
         }
         report["images"].append(row)
-        print(f"[{image_no}] {g_path.name}")
-        print(f"    AOI panel mm : X={aoi_x:.6f}, Y={aoi_y:.6f}")
-        print(f"    BEST ODB mm  : X={current_x:.6f}, Y={current_y:.6f}")
-        print(f"    delta mm     : dX={dx:.6f}, dY={dy:.6f}, distance={math.hypot(dx, dy):.6f}")
-        print(f"    score        : {best_score:.6f}")
-        print(f"    layers       : signal={best_meta['signal_layer']} drill={best_meta['drill_layers_considered']}")
-        print(f"    output       : {best_path}")
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"    BEST ODB mm  : X={current_x:.6f}, Y={current_y:.6f}", flush=True)
+        print(f"    delta mm     : dX={dx:.6f}, dY={dy:.6f}, distance={math.hypot(dx, dy):.6f}", flush=True)
+        print(f"    score        : {best_score:.6f}", flush=True)
+        print(f"    total elapsed: {_fmt_seconds(row['elapsed_seconds'])}", flush=True)
+        print(f"    output       : {best_path}", flush=True)
 
-    report_path = output_root / "local_coordinate_search.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Report: {report_path}")
+    print(f"Report: {report_path}", flush=True)
     return 0
 
 
