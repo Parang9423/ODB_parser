@@ -22,7 +22,7 @@ jobs:
           python -m py_compile \
             app.py app_core.py odb_cam_renderer.py hierarchy_renderer.py \
             step_composite_renderer.py dump_step_coords.py ert_parser.py guide_drill.py \
-            validate_coordinates.py generate_cam_crops.py compare_full_render_crop.py search_coordinate_mapping.py search_local_coordinate_match.py calibrate_global_coordinates.py \
+            validate_coordinates.py generate_cam_crops.py compare_full_render_crop.py search_coordinate_mapping.py search_local_coordinate_match.py calibrate_global_coordinates.py search_coordinate_constellation.py \
             aoi/__init__.py aoi/ert.py aoi/coordinate_validation.py \
             alignment/__init__.py alignment/guide_drill.py \
             render/__init__.py render/hierarchy.py render/composite.py render/roi.py render/surface_validation.py \
