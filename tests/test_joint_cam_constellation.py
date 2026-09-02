@@ -1,5 +1,4 @@
-from search_joint_cam_constellation import ORIENTATIONS, _offset, _nearest_group, _joint_score
-from PIL import Image
+from search_joint_cam_constellation import ORIENTATIONS, _offset, _nearest_group, _joint_score_values, _candidate_centers
 
 
 def _d(x,y,name): return {"image_context":{"x_mm":x,"y_mm":y,"image_path":name}}
@@ -14,12 +13,11 @@ def test_nearest_group_selects_central_anchor_and_neighbors():
     assert g[0]["image_context"]["image_path"]=="b"
     assert "far" not in {x["image_context"]["image_path"] for x in g}
 
-def test_joint_geometric_mean_penalizes_one_bad_member():
-    # Identical binary structures score high; a solid mismatch is strongly penalized.
-    ref=Image.new("L",(20,20),0)
-    for x in range(5,15):
-        for y in range(5,15): ref.putpixel((x,y),255)
-    good=ref.copy(); bad=Image.new("L",(20,20),255)
-    all_good,_,_=_joint_score([good,good],[ref,ref])
-    one_bad,_,_=_joint_score([good,bad],[ref,ref])
-    assert all_good > one_bad
+def test_joint_geometric_mean_penalizes_bad_member():
+    assert _joint_score_values([.8,.8,.8]) > _joint_score_values([.8,.8,.02])
+
+def test_candidate_centers_deduplicate_overlapping_beams():
+    pts=_candidate_centers([(0,0),(1,0)],1,1)
+    assert len(pts)==12
+    assert (0.0,0.0) in pts
+    assert (2.0,1.0) in pts
