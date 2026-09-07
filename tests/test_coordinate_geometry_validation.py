@@ -1,22 +1,14 @@
-from validate_coordinate_geometry import _inside, _map_top_left, _sample_details
+from validate_coordinate_geometry import _apply,_bounds,_center,_inside,_union,ORIENTATIONS
 
+def test_swap_negative_orientation():
+    assert _apply(ORIENTATIONS["SWAP_X-_Y-"],(45.0,100.0))==(-100.0,-45.0)
 
-def test_top_left_mm_maps_to_cartesian_bounds():
-    bounds=[-100.0,-50.0,100.0,50.0]
-    assert _map_top_left(bounds,0,0)==(-100.0,50.0)
-    assert _map_top_left(bounds,200,100)==(100.0,-50.0)
-    assert _map_top_left(bounds,25,10)==(-75.0,40.0)
+def test_bounds_and_center():
+    b=_bounds([(-2,3),(4,-5),(1,9)])
+    assert b==[-2,-5,4,9]
+    assert _center(b)==(1,2)
 
-
-def test_inside_bounds():
-    assert _inside((-100,50),[-100,-50,100,50])
-    assert not _inside((100.1,0),[-100,-50,100,50])
-
-
-def _d(x,y): return {"image_context":{"x_mm":x,"y_mm":y}}
-
-
-def test_sample_details_spreads_across_aoi_x():
-    rows=[_d(x,0) for x in range(10)]
-    picked=_sample_details(rows,3)
-    assert [r["image_context"]["x_mm"] for r in picked]==[0,4,9]
+def test_inside_and_union():
+    assert _inside((0,0),[-1,-1,1,1])
+    assert not _inside((2,0),[-1,-1,1,1])
+    assert _union([[-2,-3,0,1],[1,-1,5,4]])==[-2,-3,5,4]
