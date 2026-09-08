@@ -3,7 +3,7 @@ name = "odb-parser-cam-renderer"
 version = "0.1.0"
 description = "Desktop ODB++ CAM image preview and renderer for AOI reference generation"
 requires-python = ">=3.10"
-dependencies = ["Pillow>=10.0"]
+dependencies = ["Pillow>=10.0", "Shapely>=2.0"]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
