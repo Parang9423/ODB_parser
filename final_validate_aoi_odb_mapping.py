@@ -25,7 +25,7 @@ from aoi.ert import parse_ert
 from hierarchy_renderer import FastODBRenderer
 from odb_cam_renderer import contours_bounds, extract_input
 from render.roi import render_roi_cam
-from validation_utils import _find_reference, _fmt_seconds, _score_crop
+from validation_utils import _find_reference, _fmt_seconds, score_crop
 
 ORIENTATION = "SWAP_X+_Y-"
 MATRIX = ((0.0, 1.0), (-1.0, 0.0))
@@ -150,7 +150,7 @@ def main() -> int:
             cam = render_roi_cam(job, odb_x, odb_y, reference.width, reference.height, resolution, resources.layer)
             if isinstance(cam, tuple):
                 cam = cam[0]
-            scores = _score_crop(reference, cam)
+            scores = score_crop(reference, cam)
             results.append({
                 "sample": idx, "g_image": str(ctx.path), "reference_c": str(ref_path),
                 "odb_path": str(resources.odb_path), "layer": resources.layer,
