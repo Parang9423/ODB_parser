@@ -23,7 +23,8 @@ jobs:
             app.py app_core.py odb_cam_renderer.py hierarchy_renderer.py area_classifier.py \
             step_composite_renderer.py dump_step_coords.py ert_parser.py guide_drill.py \
             final_validate_aoi_odb_mapping.py validate_layer_sweep.py generate_cam_crops.py validation_utils.py \
-            aoi/__init__.py aoi/ert.py aoi/coordinate_validation.py aoi/contour_mapping.py \
+            aoi/__init__.py aoi/ert.py aoi/coordinate_validation.py aoi/contour_mapping.py aoi/synthetic_contours.py \
+            odb/__init__.py odb/feature_query.py \
             alignment/__init__.py alignment/guide_drill.py \
             render/__init__.py render/hierarchy.py render/composite.py render/roi.py render/surface_validation.py \
             ui/__init__.py ui/defaults.py ui/platform.py ui/layer_dialog.py ui/main_window.py
