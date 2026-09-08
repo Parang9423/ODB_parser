@@ -21,7 +21,7 @@ from app_core import inspect_job
 from hierarchy_renderer import FastODBRenderer
 from odb_cam_renderer import extract_input
 from render.roi import _feature_diagnostics, _render_layer_mask, roi_bounds_in, select_roi_layers
-from search_local_coordinate_match import _score_crop
+from validation_utils import _score_crop
 
 VISIBLE_STEPS=("pnl","strip","unit")
 
@@ -100,7 +100,6 @@ def main()->int:
                     render_candidates=candidates[:args.max_render_layers]
                 else: render_candidates=candidates
                 rendered=[]
-                by_name={r["name"]:r for r in layer_rows}
                 for ci,cand in enumerate(render_candidates,1):
                     name=cand["name"]; print(f"  render {ci}/{len(render_candidates)} {name}",flush=True)
                     mask=_render_layer_mask(renderer,root,name,visible,bounds,reference.width,reference.height)
