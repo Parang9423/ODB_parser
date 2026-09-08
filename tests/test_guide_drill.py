@@ -9,7 +9,7 @@ class FakeRenderer:
         return Path("/") / step
 
     def _feature_data(self, path):
-        if str(path).endswith("/pnl/layers/gdrill/features"):
+        if path.as_posix().endswith("/pnl/layers/gdrill/features"):
             return {1: "r100"}, (
                 "$1 r100",
                 "P 1.0 2.0 1 P 0",
