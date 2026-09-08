@@ -68,9 +68,24 @@ def _translation(ert_yx_bounds: list[float], strip_array_bounds: list[float]) ->
     return scx - ecx, scy - ecy
 
 
-def map_aoi_to_odb(aoi_x_mm: float, aoi_y_mm: float, tx_mm: float, ty_mm: float) -> tuple[float, float]:
+def map_aoi_to_odb(
+    aoi_x_mm: float,
+    aoi_y_mm: float,
+    tx_mm: float | tuple[float, float],
+    ty_mm: float | None = None,
+) -> tuple[float, float]:
+    """Map AOI mm coordinates to ODB mm using the fixed SWAP_X+_Y- transform.
+
+    Accepts either ``(tx, ty)`` as one tuple for backward compatibility or
+    separate ``tx_mm, ty_mm`` values.
+    """
+    if ty_mm is None:
+        try:
+            tx_mm, ty_mm = tx_mm
+        except (TypeError, ValueError) as exc:
+            raise TypeError("translation must be (tx, ty) or separate tx_mm, ty_mm") from exc
     x, y = _apply((aoi_x_mm, aoi_y_mm))
-    return x + tx_mm, y + ty_mm
+    return x + float(tx_mm), y + float(ty_mm)
 
 
 def spatial_pick(rows: list[ImageContext], count: int) -> list[ImageContext]:
@@ -107,7 +122,7 @@ def _strip_array_bounds(renderer: FastODBRenderer) -> list[float]:
         local = contours_bounds(profile)
         if local is None:
             continue
-        pts = [inst.transform.apply(x, y) for x, y in _corners(list(local))]
+        pts = [inst.transform.apply((x, y)) for x, y in _corners(list(local))]
         bounds.append(_bounds(pts))
     if not bounds:
         raise ValueError("STRIP profiles have no usable bounds")
