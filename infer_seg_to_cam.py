@@ -65,6 +65,29 @@ def _class_name(names: Any, class_id: int) -> str:
     return str(class_id)
 
 
+def _select_pairs(
+    pairs: list[tuple[Path, Path]],
+    *,
+    image: str | None = None,
+    limit: int | None = None,
+) -> list[tuple[Path, Path]]:
+    """Filter discovered G/C pairs before model inference."""
+    selected = pairs
+
+    if image:
+        requested = Path(image).name.casefold()
+        selected = [pair for pair in selected if pair[0].name.casefold() == requested]
+        if not selected:
+            raise ValueError(f"Requested G image was not found among matched G/C pairs: {image}")
+
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        selected = selected[:limit]
+
+    return selected
+
+
 def run(
     gids_dir: Path,
     output_dir: Path,
@@ -73,13 +96,16 @@ def run(
     conf: float = 0.25,
     device: str | None = None,
     line_width: int = 2,
+    image: str | None = None,
+    limit: int | None = None,
 ) -> dict:
     if not 0.0 <= conf <= 1.0:
         raise ValueError("conf must be between 0 and 1")
 
-    pairs = discover_gid_pairs(gids_dir)
-    if not pairs:
+    discovered_pairs = discover_gid_pairs(gids_dir)
+    if not discovered_pairs:
         raise ValueError(f"No matching G/C image pairs found under {gids_dir}")
+    pairs = _select_pairs(discovered_pairs, image=image, limit=limit)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     model = _load_yolo(model_path)
@@ -104,7 +130,6 @@ def run(
             raise RuntimeError(f"YOLO returned no result object for {source_path}")
         result = results[0]
 
-        source_contours: list[list[tuple[float, float]]] = []
         cam_contours: list[list[tuple[float, float]]] = []
         detections: list[dict] = []
 
@@ -120,7 +145,6 @@ def run(
             if len(source_contour) < 3:
                 continue
             cam_contour = map_contour_by_shared_center(source_contour, source_size, cam_size)
-            source_contours.append(source_contour)
             cam_contours.append(cam_contour)
 
             class_id = int(cls_values[index]) if index < len(cls_values) else -1
@@ -157,16 +181,19 @@ def run(
         "model": str(model_path),
         "gids_dir": str(gids_dir),
         "output_dir": str(output_dir),
-        "pair_count": len(pairs),
+        "discovered_pair_count": len(discovered_pairs),
+        "processed_pair_count": len(pairs),
+        "selection": {"image": image, "limit": limit},
         "confidence_threshold": conf,
         "items": items,
     }
     report_path = output_dir / "seg_cam_overlay_report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Model        : {model_path}")
-    print(f"Matched pairs: {len(pairs)}")
-    print(f"Output       : {output_dir}")
-    print(f"Report       : {report_path}")
+    print(f"Model           : {model_path}")
+    print(f"Discovered pairs: {len(discovered_pairs)}")
+    print(f"Processed pairs : {len(pairs)}")
+    print(f"Output          : {output_dir}")
+    print(f"Report          : {report_path}")
     return report
 
 
@@ -184,6 +211,14 @@ def main() -> int:
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--device", default=None, help="Ultralytics device, e.g. 0, cpu, cuda:0")
     parser.add_argument("--line-width", type=int, default=2)
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Process only the first N matched G/C pairs.",
+    )
+    parser.add_argument(
+        "--image", default=None,
+        help="Process only this G image filename, e.g. G_383.205_63.183_19.jpg.",
+    )
     args = parser.parse_args()
 
     model_path = _resolve_model(args.model, args.models_dir)
@@ -194,6 +229,8 @@ def main() -> int:
         conf=args.conf,
         device=args.device,
         line_width=args.line_width,
+        image=args.image,
+        limit=args.limit,
     )
     return 0
 
