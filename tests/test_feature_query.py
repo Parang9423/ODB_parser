@@ -3,7 +3,7 @@ import pytest
 shapely = pytest.importorskip("shapely")
 from shapely.geometry import LineString, Point, box
 
-from odb.feature_query import DefectContourQuery, ODBVectorFeature
+from odb.feature_query import DefectContourQuery, ODBVectorFeature, _geometry_in_to_mm
 
 
 def feature(feature_id, geometry, primitive="P", layer="l1_tu"):
@@ -43,7 +43,6 @@ def test_multiple_features_can_intersect_one_defect():
 
 
 def test_bbox_candidate_that_does_not_exactly_intersect_is_removed():
-    # The two triangles' bounding boxes overlap, but their actual polygons do not.
     from shapely.geometry import Polygon
     defect = Polygon([(0, 0), (4, 0), (0, 4)])
     candidate = feature("bbox-only", Polygon([(3, 3), (4, 3), (3, 4)]))
@@ -53,11 +52,17 @@ def test_bbox_candidate_that_does_not_exactly_intersect_is_removed():
 
 
 def test_overlap_is_relative_to_defect_area():
-    defect = box(0, 0, 4, 4)  # area 16
-    hit = feature("half", box(0, 0, 2, 4))  # intersection area 8
+    defect = box(0, 0, 4, 4)
+    hit = feature("half", box(0, 0, 2, 4))
     result = DefectContourQuery([hit]).query(defect)[0]
     assert result.intersection_area == pytest.approx(8.0)
     assert result.defect_overlap_pct == pytest.approx(50.0)
+
+
+def test_odb_geometry_is_scaled_from_inches_to_mm():
+    converted = _geometry_in_to_mm(box(0, 0, 1, 2))
+    assert converted.bounds == pytest.approx((0.0, 0.0, 25.4, 50.8))
+    assert converted.area == pytest.approx(25.4 * 50.8)
 
 
 def test_invalid_defect_polygon_rejected():
