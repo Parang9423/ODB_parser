@@ -9,6 +9,7 @@ from aoi.contour_mapping import AoiOdbTransform
 from aoi.seg_result import iter_detection_odb_polygons, load_seg_result, parse_aoi_image_filename
 from hierarchy_renderer import FastODBRenderer
 from odb.effective_geometry import EffectiveLayerGeometry
+from odb.feature_metadata import describe_feature_source, summarize_feature_sources
 from odb.feature_query import DefectContourQuery, extract_vector_features
 from odb_cam_renderer import extract_input
 from render.roi import select_roi_layers
@@ -45,6 +46,7 @@ def diagnose(
         )
         query = DefectContourQuery(features)
         effective_layer = EffectiveLayerGeometry(features)
+        source_metadata_inventory = summarize_feature_sources(renderer, features)
 
         positive_count = sum(feature.polarity.upper() == "P" for feature in features)
         negative_count = sum(feature.polarity.upper() == "N" for feature in features)
@@ -60,6 +62,22 @@ def diagnose(
         ):
             hits = query.query(polygon)
             effective = effective_layer.intersect(polygon)
+            hit_rows = []
+            for hit in sorted(hits, key=lambda row: row.defect_overlap_pct, reverse=True):
+                hit_rows.append({
+                    "feature_id": hit.feature.feature_id,
+                    "layer": hit.feature.layer,
+                    "step": hit.feature.step,
+                    "depth": hit.feature.depth,
+                    "primitive_type": hit.feature.primitive_type,
+                    "symbol": hit.feature.symbol,
+                    "polarity": hit.feature.polarity,
+                    "feature_bounds_mm": list(hit.feature.bounds),
+                    "intersection_area_mm2": hit.intersection_area,
+                    "defect_overlap_pct": hit.defect_overlap_pct,
+                    "source_record": describe_feature_source(renderer, hit.feature),
+                })
+
             detections.append({
                 "index": index,
                 "ai_class_id": detection.class_id,
@@ -82,21 +100,7 @@ def diagnose(
                     "applied_feature_ids": list(effective.applied_feature_ids),
                     "note": "Residual is defect area outside effective signal-layer material; it is not yet classified as business SPACE.",
                 },
-                "hits": [
-                    {
-                        "feature_id": hit.feature.feature_id,
-                        "layer": hit.feature.layer,
-                        "step": hit.feature.step,
-                        "depth": hit.feature.depth,
-                        "primitive_type": hit.feature.primitive_type,
-                        "symbol": hit.feature.symbol,
-                        "polarity": hit.feature.polarity,
-                        "feature_bounds_mm": list(hit.feature.bounds),
-                        "intersection_area_mm2": hit.intersection_area,
-                        "defect_overlap_pct": hit.defect_overlap_pct,
-                    }
-                    for hit in sorted(hits, key=lambda row: row.defect_overlap_pct, reverse=True)
-                ],
+                "hits": hit_rows,
             })
 
         return {
@@ -118,6 +122,11 @@ def diagnose(
             "extracted_positive_feature_count": positive_count,
             "extracted_negative_feature_count": negative_count,
             "composition_order": "renderer-compatible child-before-parent, record order within each feature file",
+            "source_metadata_inventory": source_metadata_inventory,
+            "metadata_interpretation_policy": (
+                "Raw metadata is emitted as evidence only. No token/prefix is treated as PAD, CIRCUIT, NET, "
+                "COMPONENT or SPACE until its meaning is verified on this ODB dataset."
+            ),
             "detections": detections,
         }
     finally:
@@ -128,8 +137,8 @@ def diagnose(
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Map SEG JSON contours to ODB coordinates, report raw intersecting ODB features, "
-            "and compose effective positive/negative signal-layer geometry inside each defect."
+            "Map SEG JSON contours to ODB coordinates, report exact intersecting ODB features, "
+            "compose effective polarity geometry, and preserve raw feature metadata for interpretation."
         )
     )
     parser.add_argument("seg_json", type=Path)
