@@ -9,3 +9,4 @@ build/
 *.png
 *.tgz
 *.tar.gz
+models/*.pt
