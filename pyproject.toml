@@ -7,3 +7,4 @@ dependencies = ["Pillow>=10.0", "Shapely>=2.0"]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+ai = ["ultralytics>=8.0"]
