@@ -46,7 +46,8 @@ def _shapely():
     return Point, LineString, Polygon, unary_union, shapely_transform
 
 
-def _to_mm_geometry(geometry):
+def _geometry_in_to_mm(geometry):
+    """Scale a Shapely geometry from ODB renderer inches to millimetres."""
     *_, shapely_transform = _shapely()
     return shapely_transform(lambda x, y, z=None: (x * INCH_TO_MM, y * INCH_TO_MM), geometry)
 
@@ -216,7 +217,7 @@ def extract_vector_features(
                     continue
                 if positive_only and polarity != "P":
                     continue
-                geometry = _to_mm_geometry(geometry)
+                geometry = _geometry_in_to_mm(geometry)
                 features.append(ODBVectorFeature(
                     feature_id=f"{instance.step}:{instance_index}:{layer}:{record_index}",
                     layer=layer,
