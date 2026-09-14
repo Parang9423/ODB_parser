@@ -3,16 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence, Tuple
 
-from hierarchy_renderer import FastODBRenderer
-from odb_cam_renderer import arc_points, parse_standard_symbol, round_symbol_diameter_in
+from hierarchy_renderer import FastODBRenderer, StepInstance
+from odb_cam_renderer import Transform, arc_points, parse_standard_symbol, round_symbol_diameter_in
 
 Bounds = Tuple[float, float, float, float]
-IN_TO_MM = 25.4
+INCH_TO_MM = 25.4
 
 
 @dataclass(frozen=True)
 class ODBVectorFeature:
-    """One ODB primitive flattened into the root-step frame in millimetres."""
+    """One ODB primitive flattened into the root-step coordinate frame in millimetres."""
 
     feature_id: str
     layer: str
@@ -32,32 +32,34 @@ class ODBVectorFeature:
 class FeatureIntersection:
     feature: ODBVectorFeature
     intersection_geometry: object
-    intersection_area: float  # mm^2
+    intersection_area: float
     defect_overlap_pct: float
 
 
 def _shapely():
     try:
         from shapely.geometry import LineString, Point, Polygon
+        from shapely.ops import transform as shapely_transform
         from shapely.ops import unary_union
     except ImportError as exc:
         raise RuntimeError("Shapely is required for ODB vector feature queries") from exc
-    return Point, LineString, Polygon, unary_union
+    return Point, LineString, Polygon, unary_union, shapely_transform
 
 
-def _geometry_in_to_mm(geometry):
-    from shapely.affinity import scale
-    return scale(geometry, xfact=IN_TO_MM, yfact=IN_TO_MM, origin=(0.0, 0.0))
+def _to_mm_geometry(geometry):
+    *_, shapely_transform = _shapely()
+    return shapely_transform(lambda x, y, z=None: (x * INCH_TO_MM, y * INCH_TO_MM), geometry)
 
 
 def _pad_geometry(x: float, y: float, symbol: str, rotation_deg: float, transform):
-    Point, _, Polygon, _ = _shapely()
+    Point, _, Polygon, _, _ = _shapely()
     parsed = parse_standard_symbol(symbol)
     if parsed is None:
         return None
     kind, width, height = parsed
     if kind == "round":
-        return Point(transform.apply((x, y))).buffer(width / 2.0, quad_segs=16)
+        center = Point(transform.apply((x, y)))
+        return center.buffer(width / 2.0, quad_segs=16)
 
     from shapely.affinity import rotate
     local = Polygon([
@@ -72,13 +74,14 @@ def _pad_geometry(x: float, y: float, symbol: str, rotation_deg: float, transfor
 
 
 def _line_geometry(x1: float, y1: float, x2: float, y2: float, diameter: float, transform):
-    _, LineString, _, _ = _shapely()
+    _, LineString, _, _, _ = _shapely()
     line = LineString([transform.apply((x1, y1)), transform.apply((x2, y2))])
     return line.buffer(diameter / 2.0, cap_style=1, join_style=1, quad_segs=16)
 
 
 def _surface_geometry(contours):
-    _, _, Polygon, unary_union = _shapely()
+    """Build one ODB surface using I contours as solids and H contours as holes."""
+    _, _, Polygon, unary_union, _ = _shapely()
     islands = []
     holes = []
     for kind, points in contours:
@@ -101,6 +104,29 @@ def _surface_geometry(contours):
     return geom if not geom.is_empty else None
 
 
+def _collect_instances_render_order(renderer: FastODBRenderer, root_step: str) -> List[StepInstance]:
+    """Return hierarchy instances in the same child-before-parent order as rendering."""
+    instances: List[StepInstance] = []
+
+    def walk(step: str, transform: Transform, depth: int) -> None:
+        if depth > 8:
+            raise ValueError("STEP-REPEAT recursion too deep")
+        step_name = step.lower()
+        for repeat in renderer._repeats(step_name):
+            for iy in range(repeat.ny):
+                for ix in range(repeat.nx):
+                    tx = repeat.x + ix * repeat.dx
+                    ty = repeat.y + iy * repeat.dy
+                    child = transform.compose(
+                        renderer._child_transform(repeat.name, tx, ty, repeat.angle, repeat.mirror)
+                    )
+                    walk(repeat.name, child, depth + 1)
+        instances.append(StepInstance(step_name, depth, transform))
+
+    walk(root_step.lower(), Transform(), 0)
+    return instances
+
+
 def extract_vector_features(
     renderer: FastODBRenderer,
     root_step: str,
@@ -108,17 +134,17 @@ def extract_vector_features(
     visible_steps: Iterable[str] | None = None,
     positive_only: bool = True,
 ) -> List[ODBVectorFeature]:
-    """Flatten supported ODB P/L/S primitives into root-step millimetres.
+    """Flatten supported ODB P/L/S primitives into root-step coordinates in mm.
 
-    ODB feature coordinates/apertures are parsed in inches by the renderer.
-    Geometry is converted to millimetres before being returned so it can be
-    intersected directly with AOI/SEG polygons from aoi.contour_mapping.
+    Feature order follows the renderer's child-before-parent hierarchy traversal so
+    positive/negative composition can reproduce raster semantics. Unsupported
+    symbols/records are skipped rather than guessed.
     """
     wanted_layers = tuple(dict.fromkeys(str(layer).lower() for layer in layers if layer))
     visible = None if visible_steps is None else {str(step).lower() for step in visible_steps}
     features: List[ODBVectorFeature] = []
 
-    for instance_index, instance in enumerate(renderer.collect_instances(root_step)):
+    for instance_index, instance in enumerate(_collect_instances_render_order(renderer, root_step)):
         if visible is not None and instance.step not in visible:
             continue
         step_dir = renderer._step_dir(instance.step)
@@ -190,7 +216,7 @@ def extract_vector_features(
                     continue
                 if positive_only and polarity != "P":
                     continue
-                geometry = _geometry_in_to_mm(geometry)
+                geometry = _to_mm_geometry(geometry)
                 features.append(ODBVectorFeature(
                     feature_id=f"{instance.step}:{instance_index}:{layer}:{record_index}",
                     layer=layer,
@@ -209,10 +235,10 @@ def _bounds_overlap(a: Bounds, b: Bounds) -> bool:
 
 
 class DefectContourQuery:
-    """Exact contour-to-feature intersection query in millimetres.
+    """Exact contour-to-feature intersection query.
 
     Bounds checks are only a candidate prefilter. A feature is returned only
-    when its geometry has a positive-area exact intersection with the defect.
+    when its geometry has a non-empty positive-area intersection with the defect.
     """
 
     def __init__(self, features: Sequence[ODBVectorFeature]):
