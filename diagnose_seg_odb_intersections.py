@@ -8,6 +8,7 @@ from pathlib import Path
 from aoi.contour_mapping import AoiOdbTransform
 from aoi.seg_result import iter_detection_odb_polygons, load_seg_result, parse_aoi_image_filename
 from hierarchy_renderer import FastODBRenderer
+from odb.effective_geometry import EffectiveLayerGeometry
 from odb.feature_query import DefectContourQuery, extract_vector_features
 from odb_cam_renderer import extract_input
 from render.roi import select_roi_layers
@@ -40,9 +41,13 @@ def diagnose(
             renderer=renderer,
             root_step=root_step,
             layers=[signal_layer],
-            positive_only=True,
+            positive_only=False,
         )
         query = DefectContourQuery(features)
+        effective_layer = EffectiveLayerGeometry(features)
+
+        positive_count = sum(feature.polarity.upper() == "P" for feature in features)
+        negative_count = sum(feature.polarity.upper() == "N" for feature in features)
 
         detections = []
         for index, (detection, polygon) in enumerate(
@@ -54,6 +59,7 @@ def diagnose(
             )
         ):
             hits = query.query(polygon)
+            effective = effective_layer.intersect(polygon)
             detections.append({
                 "index": index,
                 "ai_class_id": detection.class_id,
@@ -63,7 +69,19 @@ def diagnose(
                 "contour_point_count": len(detection.mask_contour),
                 "defect_polygon_bounds_mm": _bounds_list(polygon),
                 "defect_area_mm2": float(polygon.area),
-                "hit_count": len(hits),
+                "raw_hit_count": len(hits),
+                "raw_positive_hit_count": sum(hit.feature.polarity.upper() == "P" for hit in hits),
+                "raw_negative_hit_count": sum(hit.feature.polarity.upper() == "N" for hit in hits),
+                "effective_layer": {
+                    "effective_material_area_mm2": effective.area_mm2,
+                    "effective_material_overlap_pct": effective.overlap_pct,
+                    "residual_area_mm2": effective.residual_area_mm2,
+                    "residual_pct": effective.residual_pct,
+                    "positive_hit_count": effective.positive_hit_count,
+                    "negative_hit_count": effective.negative_hit_count,
+                    "applied_feature_ids": list(effective.applied_feature_ids),
+                    "note": "Residual is defect area outside effective signal-layer material; it is not yet classified as business SPACE.",
+                },
                 "hits": [
                     {
                         "feature_id": hit.feature.feature_id,
@@ -97,6 +115,9 @@ def diagnose(
             "recipe_layer": recipe_layer,
             "odb_signal_layer": signal_layer,
             "extracted_feature_count": len(features),
+            "extracted_positive_feature_count": positive_count,
+            "extracted_negative_feature_count": negative_count,
+            "composition_order": "renderer-compatible child-before-parent, record order within each feature file",
             "detections": detections,
         }
     finally:
@@ -106,7 +127,10 @@ def diagnose(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Map SEG JSON contours to ODB coordinates and report exact intersecting ODB features."
+        description=(
+            "Map SEG JSON contours to ODB coordinates, report raw intersecting ODB features, "
+            "and compose effective positive/negative signal-layer geometry inside each defect."
+        )
     )
     parser.add_argument("seg_json", type=Path)
     parser.add_argument("odb_input", type=Path, help="ODB++ .tgz/.tar.gz or extracted job directory")
