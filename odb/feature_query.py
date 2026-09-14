@@ -3,15 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence, Tuple
 
-from hierarchy_renderer import FastODBRenderer, StepInstance
+from hierarchy_renderer import FastODBRenderer
 from odb_cam_renderer import arc_points, parse_standard_symbol, round_symbol_diameter_in
 
 Bounds = Tuple[float, float, float, float]
+IN_TO_MM = 25.4
 
 
 @dataclass(frozen=True)
 class ODBVectorFeature:
-    """One positive ODB primitive flattened into the root-step coordinate frame."""
+    """One ODB primitive flattened into the root-step frame in millimetres."""
 
     feature_id: str
     layer: str
@@ -31,7 +32,7 @@ class ODBVectorFeature:
 class FeatureIntersection:
     feature: ODBVectorFeature
     intersection_geometry: object
-    intersection_area: float
+    intersection_area: float  # mm^2
     defect_overlap_pct: float
 
 
@@ -44,9 +45,9 @@ def _shapely():
     return Point, LineString, Polygon, unary_union
 
 
-def _transform_polygon(points, transform):
-    _, _, Polygon, _ = _shapely()
-    return Polygon([transform.apply(point) for point in points])
+def _geometry_in_to_mm(geometry):
+    from shapely.affinity import scale
+    return scale(geometry, xfact=IN_TO_MM, yfact=IN_TO_MM, origin=(0.0, 0.0))
 
 
 def _pad_geometry(x: float, y: float, symbol: str, rotation_deg: float, transform):
@@ -56,10 +57,7 @@ def _pad_geometry(x: float, y: float, symbol: str, rotation_deg: float, transfor
         return None
     kind, width, height = parsed
     if kind == "round":
-        center = Point(transform.apply((x, y)))
-        # Shapely's buffer approximates the round aperture. quad_segs is kept
-        # reasonably high because these geometries feed area-overlap decisions.
-        return center.buffer(width / 2.0, quad_segs=16)
+        return Point(transform.apply((x, y))).buffer(width / 2.0, quad_segs=16)
 
     from shapely.affinity import rotate
     local = Polygon([
@@ -80,7 +78,6 @@ def _line_geometry(x1: float, y1: float, x2: float, y2: float, diameter: float, 
 
 
 def _surface_geometry(contours):
-    """Build an ODB surface using I contours as solids and H contours as holes."""
     _, _, Polygon, unary_union = _shapely()
     islands = []
     holes = []
@@ -111,10 +108,11 @@ def extract_vector_features(
     visible_steps: Iterable[str] | None = None,
     positive_only: bool = True,
 ) -> List[ODBVectorFeature]:
-    """Flatten supported ODB P/L/S primitives into root-step coordinates.
+    """Flatten supported ODB P/L/S primitives into root-step millimetres.
 
-    This is deliberately read-only and reuses FastODBRenderer's hierarchy and
-    feature caches. Unsupported symbols/records are skipped rather than guessed.
+    ODB feature coordinates/apertures are parsed in inches by the renderer.
+    Geometry is converted to millimetres before being returned so it can be
+    intersected directly with AOI/SEG polygons from aoi.contour_mapping.
     """
     wanted_layers = tuple(dict.fromkeys(str(layer).lower() for layer in layers if layer))
     visible = None if visible_steps is None else {str(step).lower() for step in visible_steps}
@@ -192,6 +190,7 @@ def extract_vector_features(
                     continue
                 if positive_only and polarity != "P":
                     continue
+                geometry = _geometry_in_to_mm(geometry)
                 features.append(ODBVectorFeature(
                     feature_id=f"{instance.step}:{instance_index}:{layer}:{record_index}",
                     layer=layer,
@@ -210,10 +209,10 @@ def _bounds_overlap(a: Bounds, b: Bounds) -> bool:
 
 
 class DefectContourQuery:
-    """Exact contour-to-feature intersection query.
+    """Exact contour-to-feature intersection query in millimetres.
 
     Bounds checks are only a candidate prefilter. A feature is returned only
-    when its geometry has a non-empty exact intersection with the defect.
+    when its geometry has a positive-area exact intersection with the defect.
     """
 
     def __init__(self, features: Sequence[ODBVectorFeature]):
@@ -232,8 +231,6 @@ class DefectContourQuery:
             if intersection.is_empty:
                 continue
             area = float(intersection.area)
-            # Boundary-only contact is not an affected area for the current
-            # business-area overlap policy. Keep exact positive-area hits only.
             if area <= 0:
                 continue
             hits.append(FeatureIntersection(
