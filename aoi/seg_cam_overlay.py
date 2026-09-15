@@ -11,6 +11,7 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 _COORD_RE = re.compile(
     r"^(?P<prefix>[GCgc])_(?P<y>-?\d+(?:\.\d+)?)_(?P<x>-?\d+(?:\.\d+)?)"
 )
+_GENERATED_OVERLAY_SUFFIX = "_SEG_OVERLAY"
 
 
 def parse_coordinate_key(path_or_name: str | Path) -> tuple[float, float]:
@@ -40,7 +41,12 @@ def image_role(path_or_name: str | Path) -> str | None:
 
 
 def discover_gid_pairs(gids_dir: str | Path) -> list[tuple[Path, Path]]:
-    """Pair G and C images recursively by their first two physical coordinates."""
+    """Pair original G and C images recursively by their first two physical coordinates.
+
+    Generated ``*_SEG_OVERLAY`` files are intentionally ignored.  The default
+    output directory lives under ``data/GIDS`` and recursive discovery would
+    otherwise treat a previous overlay as a second C image on the next run.
+    """
     root = Path(gids_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"GIDS directory not found: {root}")
@@ -49,6 +55,8 @@ def discover_gid_pairs(gids_dir: str | Path) -> list[tuple[Path, Path]]:
     cams: dict[tuple[float, float], list[Path]] = {}
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in _IMAGE_EXTS:
+            continue
+        if path.stem.upper().endswith(_GENERATED_OVERLAY_SUFFIX):
             continue
         role = image_role(path)
         if role is None:
