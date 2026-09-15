@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,10 @@ def run(
             cam_size = cam_im.size
             cam_copy = cam_im.copy()
 
+        # Keep the original G_* AOI crop next to its CAM overlay for direct visual comparison.
+        source_output_path = output_dir / source_path.name
+        shutil.copy2(source_path, source_output_path)
+
         kwargs = {
             "source": str(source_path),
             "conf": conf,
@@ -164,6 +169,7 @@ def run(
 
         items.append({
             "source_image": str(source_path),
+            "copied_source_image": str(source_output_path),
             "cam_image": str(cam_path),
             "output_image": str(output_path),
             "source_size_px": list(source_size),
