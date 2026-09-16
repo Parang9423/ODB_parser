@@ -40,20 +40,36 @@ def image_role(path_or_name: str | Path) -> str | None:
     return None
 
 
-def discover_gid_pairs(gids_dir: str | Path) -> list[tuple[Path, Path]]:
+def _is_within(path: Path, directory: Path) -> bool:
+    """Return True when path is directory itself or one of its descendants."""
+    try:
+        path.resolve().relative_to(directory.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def discover_gid_pairs(
+    gids_dir: str | Path,
+    *,
+    exclude_dirs: Iterable[str | Path] = (),
+) -> list[tuple[Path, Path]]:
     """Pair original G and C images recursively by their first two physical coordinates.
 
-    Generated ``*_SEG_OVERLAY`` files are intentionally ignored.  The default
-    output directory lives under ``data/GIDS`` and recursive discovery would
-    otherwise treat a previous overlay as a second C image on the next run.
+    Directories passed through ``exclude_dirs`` are completely excluded from
+    discovery.  Generated ``*_SEG_OVERLAY`` files are also ignored as a safety
+    net so previous outputs can never become new CAM inputs.
     """
     root = Path(gids_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"GIDS directory not found: {root}")
 
+    excluded = tuple(Path(directory) for directory in exclude_dirs)
     sources: dict[tuple[float, float], list[Path]] = {}
     cams: dict[tuple[float, float], list[Path]] = {}
     for path in root.rglob("*"):
+        if any(_is_within(path, directory) for directory in excluded):
+            continue
         if not path.is_file() or path.suffix.lower() not in _IMAGE_EXTS:
             continue
         if path.stem.upper().endswith(_GENERATED_OVERLAY_SUFFIX):
