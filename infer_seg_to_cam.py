@@ -103,7 +103,9 @@ def run(
     if not 0.0 <= conf <= 1.0:
         raise ValueError("conf must be between 0 and 1")
 
-    discovered_pairs = discover_gid_pairs(gids_dir)
+    # The output directory is normally inside data/GIDS. Exclude it completely
+    # so copied G images and generated C overlays can never be rediscovered as inputs.
+    discovered_pairs = discover_gid_pairs(gids_dir, exclude_dirs=(output_dir,))
     if not discovered_pairs:
         raise ValueError(f"No matching G/C image pairs found under {gids_dir}")
     pairs = _select_pairs(discovered_pairs, image=image, limit=limit)
