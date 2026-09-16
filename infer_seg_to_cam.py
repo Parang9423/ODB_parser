@@ -76,6 +76,18 @@ def _prepare_odb(odb_input: Path, recipe_layer: str, root_step: str):
     return temp_dir, selection.signal_layer, features, DefectContourQuery(features)
 
 
+def _cam_fov_odb_polygon(cam_size, center_aoi_mm, resolution_um_per_px, transform):
+    """Return the CAM field-of-view polygon in ODB coordinates."""
+    geometry = CropGeometry.isotropic(cam_size[0], cam_size[1], resolution_um_per_px)
+    contour = [
+        (0.0, 0.0),
+        (float(cam_size[0] - 1), 0.0),
+        (float(cam_size[0] - 1), float(cam_size[1] - 1)),
+        (0.0, float(cam_size[1] - 1)),
+    ]
+    return contour_pixel_to_odb_polygon(contour, center_aoi_mm, geometry, transform)
+
+
 def run(
     gids_dir: Path,
     output_dir: Path,
@@ -145,6 +157,8 @@ def run(
             detections = []
             overlay_features: dict[str, tuple[str, object]] = {}
             overlay_intersections = []
+            context_features: dict[str, tuple[str, object]] = {}
+            context_feature_count = 0
 
             masks = getattr(result, "masks", None)
             segments = [] if masks is None else list(masks.xy)
@@ -161,6 +175,27 @@ def run(
             if odb_enabled:
                 aoi_odb_transform = AoiOdbTransform(tx_mm=tx_mm, ty_mm=ty_mm)
                 crop_geometry = CropGeometry.isotropic(source_size[0], source_size[1], resolution_um_per_px)
+
+                # Visualization-only context query. Every ODB feature intersecting
+                # the CAM FOV is drawn so coordinate registration can be inspected
+                # even when the SEG defect lies entirely in empty/SPACE geometry.
+                # This context set is deliberately NOT used for defect/spec logic.
+                cam_fov_polygon = _cam_fov_odb_polygon(
+                    cam_size, center_aoi_mm, resolution_um_per_px, aoi_odb_transform
+                )
+                context_hits = query.query(cam_fov_polygon)
+                context_feature_count = len(context_hits)
+                for context_hit in context_hits:
+                    context_cam = geometry_to_cam_pixels(
+                        context_hit.feature.geometry,
+                        image_center_aoi_mm=center_aoi_mm,
+                        cam_size_px=cam_size,
+                        resolution_um_per_px=resolution_um_per_px,
+                        transform=aoi_odb_transform,
+                    )
+                    context_features[context_hit.feature.feature_id] = (
+                        context_hit.feature.primitive_type, context_cam
+                    )
 
             for index, segment in enumerate(segments):
                 source_contour = _to_python_contour(segment)
@@ -225,8 +260,18 @@ def run(
             seg_output_path = output_dir / f"{cam_path.stem}_SEG_OVERLAY.png"
             seg_overlay.save(seg_output_path, format="PNG")
 
+            odb_context_output_path = None
             odb_output_path = None
             if odb_enabled:
+                context_overlay = draw_odb_feature_overlay(
+                    cam_copy,
+                    seg_contours_px=cam_contours,
+                    feature_geometries=context_features.values(),
+                    line_width=line_width,
+                )
+                odb_context_output_path = output_dir / f"{cam_path.stem}_ODB_CONTEXT.png"
+                context_overlay.save(odb_context_output_path, format="PNG")
+
                 odb_overlay = draw_odb_feature_overlay(
                     cam_copy,
                     seg_contours_px=cam_contours,
@@ -253,6 +298,8 @@ def run(
                 "copied_source_image": str(source_output_path),
                 "cam_image": str(cam_path),
                 "seg_overlay_image": str(seg_output_path),
+                "odb_context_overlay_image": str(odb_context_output_path) if odb_context_output_path else None,
+                "odb_context_feature_count": context_feature_count if odb_enabled else None,
                 "odb_features_overlay_image": str(odb_output_path) if odb_output_path else None,
                 "odb_intersections_overlay_image": str(intersection_output_path) if intersection_output_path else None,
                 "source_size_px": list(source_size),
@@ -281,6 +328,11 @@ def run(
                 "tx_mm": tx_mm,
                 "ty_mm": ty_mm,
                 "overlay_legend": {"SEG": "red", "P": "cyan", "L": "yellow", "S": "magenta", "intersection": "green"},
+                "overlay_policy": {
+                    "ODB_CONTEXT": "all ODB features intersecting the CAM field of view; visualization only",
+                    "ODB_FEATURES": "ODB features with positive-area exact SEG-contour intersection",
+                    "ODB_INTERSECTIONS": "exact SEG/ODB intersection geometry",
+                },
             },
             "items": items,
         }
