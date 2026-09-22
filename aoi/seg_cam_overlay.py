@@ -11,7 +11,13 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 _COORD_RE = re.compile(
     r"^(?P<prefix>[GCgc])_(?P<y>-?\d+(?:\.\d+)?)_(?P<x>-?\d+(?:\.\d+)?)"
 )
-_GENERATED_OVERLAY_SUFFIX = "_SEG_OVERLAY"
+_GENERATED_OUTPUT_SUFFIXES = (
+    "_SEG_OVERLAY",
+    "_ODB_CONTEXT",
+    "_ODB_FEATURES",
+    "_ODB_INTERSECTIONS",
+)
+_OUTPUT_REPORT_NAME = "seg_cam_overlay_report.json"
 
 
 def parse_coordinate_key(path_or_name: str | Path) -> tuple[float, float]:
@@ -49,6 +55,18 @@ def _is_within(path: Path, directory: Path) -> bool:
         return False
 
 
+def _is_generated_output(path: Path) -> bool:
+    """Return True for images produced by a previous overlay run."""
+    stem_upper = path.stem.upper()
+    if any(stem_upper.endswith(suffix) for suffix in _GENERATED_OUTPUT_SUFFIXES):
+        return True
+    # run() copies the original G image into its output folder. When a later
+    # run selects a different --output, that old copy must not be rediscovered.
+    if image_role(path) == "source" and (path.parent / _OUTPUT_REPORT_NAME).is_file():
+        return True
+    return False
+
+
 def discover_gid_pairs(
     gids_dir: str | Path,
     *,
@@ -72,7 +90,7 @@ def discover_gid_pairs(
             continue
         if not path.is_file() or path.suffix.lower() not in _IMAGE_EXTS:
             continue
-        if path.stem.upper().endswith(_GENERATED_OVERLAY_SUFFIX):
+        if _is_generated_output(path):
             continue
         role = image_role(path)
         if role is None:
