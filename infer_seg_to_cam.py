@@ -282,33 +282,7 @@ def run(
                 cam_fov_polygon = _cam_fov_odb_polygon(
                     cam_size, center_aoi_mm, resolution_um_per_px, aoi_odb_transform
                 )
-                if context_all_layers:
-                    print("ODB context layer sweep: prefiltering all matrix layers at fixed CAM FOV...", flush=True)
-                    context_layer_rows, context_features = _context_layer_sweep(
-                        job=job,
-                        renderer=renderer,
-                        root_step=root_step,
-                        cam_fov_polygon=cam_fov_polygon,
-                        center_aoi_mm=center_aoi_mm,
-                        cam_size=cam_size,
-                        resolution_um_per_px=resolution_um_per_px,
-                        transform=aoi_odb_transform,
-                        cam_image=cam_copy,
-                        seg_contours=cam_contours,
-                        output_dir=output_dir,
-                        cam_stem=cam_path.stem,
-                        line_width=line_width,
-                    )
-                    context_feature_count = sum(row["fov_feature_count"] for row in context_layer_rows)
-                    active = [row for row in context_layer_rows if row["fov_feature_count"] > 0]
-                    for row in active:
-                        print(
-                            f"  {row['name']} [{row['type']}] FOV features={row['fov_feature_count']}",
-                            flush=True,
-                        )
-                    if not active:
-                        print("  No supported P/L/S geometry found in CAM FOV on any matrix layer.", flush=True)
-                else:
+                if not context_all_layers:
                     context_hits = query.query(cam_fov_polygon)
                     context_feature_count = len(context_hits)
                     for context_hit in context_hits:
@@ -381,6 +355,36 @@ def run(
                         "features": hit_rows,
                     }
                 detections.append(row)
+
+            # Run the broad layer diagnostic only after SEG contours are known so
+            # every per-layer context image contains the same red SEG overlay.
+            # Exact defect intersections above intentionally remain signal-layer only.
+            if odb_enabled and context_all_layers:
+                print("ODB context layer sweep: prefiltering all matrix layers at fixed CAM FOV...", flush=True)
+                context_layer_rows, context_features = _context_layer_sweep(
+                    job=job,
+                    renderer=renderer,
+                    root_step=root_step,
+                    cam_fov_polygon=cam_fov_polygon,
+                    center_aoi_mm=center_aoi_mm,
+                    cam_size=cam_size,
+                    resolution_um_per_px=resolution_um_per_px,
+                    transform=aoi_odb_transform,
+                    cam_image=cam_copy,
+                    seg_contours=cam_contours,
+                    output_dir=output_dir,
+                    cam_stem=cam_path.stem,
+                    line_width=line_width,
+                )
+                context_feature_count = sum(row["fov_feature_count"] for row in context_layer_rows)
+                active = [row for row in context_layer_rows if row["fov_feature_count"] > 0]
+                for row in active:
+                    print(
+                        f"  {row['name']} [{row['type']}] FOV features={row['fov_feature_count']}",
+                        flush=True,
+                    )
+                if not active:
+                    print("  No supported P/L/S geometry found in CAM FOV on any matrix layer.", flush=True)
 
             seg_overlay = draw_contours_on_cam(cam_copy, cam_contours, line_width=line_width)
             seg_output_path = output_dir / f"{cam_path.stem}_SEG_OVERLAY.png"
