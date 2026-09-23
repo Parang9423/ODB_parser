@@ -115,6 +115,7 @@ def _context_layer_sweep(
 
     rows = []
     combined: dict[str, tuple[str, object]] = {}
+    fov_features = []
     for layer in info.layers:
         diag = _feature_diagnostics(
             renderer,
@@ -142,6 +143,7 @@ def _context_layer_sweep(
             )
             layer_hits = DefectContourQuery(layer_features).query(cam_fov_polygon)
             row["fov_feature_count"] = len(layer_hits)
+            fov_features.extend(hit.feature for hit in layer_hits)
 
             layer_overlay_features: dict[str, tuple[str, object]] = {}
             for hit in layer_hits:
@@ -168,7 +170,24 @@ def _context_layer_sweep(
                 row["overlay_image"] = str(layer_path)
         rows.append(row)
 
-    return rows, combined
+    return rows, combined, fov_features
+
+
+def _feature_hit_row(hit) -> dict:
+    """Serialize one exact feature/SEG-contour positive-area intersection."""
+    return {
+        "feature_id": hit.feature.feature_id,
+        "layer": hit.feature.layer,
+        "step": hit.feature.step,
+        "depth": hit.feature.depth,
+        "primitive_type": hit.feature.primitive_type,
+        "symbol": hit.feature.symbol,
+        "polarity": hit.feature.polarity,
+        "feature_bounds_mm": [float(v) for v in hit.feature.bounds],
+        "intersection_area_mm2": float(hit.intersection_area),
+        # Percentage denominator is the SEG contour area, not the feature area.
+        "contour_overlap_pct": float(hit.defect_overlap_pct),
+    }
 
 
 def _cam_fov_odb_polygon(cam_size, center_aoi_mm, resolution_um_per_px, transform):
@@ -253,11 +272,14 @@ def run(
 
             cam_contours = []
             detections = []
+            defect_polygons = []
             overlay_features: dict[str, tuple[str, object]] = {}
             overlay_intersections = []
             context_features: dict[str, tuple[str, object]] = {}
             context_feature_count = 0
             context_layer_rows = []
+            all_layer_overlay_features: dict[str, tuple[str, object]] = {}
+            all_layer_overlay_intersections = []
 
             masks = getattr(result, "masks", None)
             segments = [] if masks is None else list(masks.xy)
@@ -336,18 +358,11 @@ def run(
                         )
                         overlay_features[hit.feature.feature_id] = (hit.feature.primitive_type, feature_cam)
                         overlay_intersections.append(intersection_cam)
-                        hit_rows.append({
-                            "feature_id": hit.feature.feature_id,
-                            "layer": hit.feature.layer,
-                            "step": hit.feature.step,
-                            "depth": hit.feature.depth,
-                            "primitive_type": hit.feature.primitive_type,
-                            "symbol": hit.feature.symbol,
-                            "polarity": hit.feature.polarity,
-                            "feature_bounds_mm": [float(v) for v in hit.feature.bounds],
-                            "intersection_area_mm2": float(hit.intersection_area),
-                            "defect_overlap_pct": float(hit.defect_overlap_pct),
-                        })
+                        hit_row = _feature_hit_row(hit)
+                        # Backward-compatible alias for existing consumers.
+                        hit_row["defect_overlap_pct"] = hit_row["contour_overlap_pct"]
+                        hit_rows.append(hit_row)
+                    defect_polygons.append(defect_polygon)
                     row["odb"] = {
                         "defect_polygon_bounds_mm": [float(v) for v in defect_polygon.bounds],
                         "defect_area_mm2": float(defect_polygon.area),
@@ -361,7 +376,7 @@ def run(
             # Exact defect intersections above intentionally remain signal-layer only.
             if odb_enabled and context_all_layers:
                 print("ODB context layer sweep: prefiltering all matrix layers at fixed CAM FOV...", flush=True)
-                context_layer_rows, context_features = _context_layer_sweep(
+                context_layer_rows, context_features, all_fov_features = _context_layer_sweep(
                     job=job,
                     renderer=renderer,
                     root_step=root_step,
@@ -377,6 +392,54 @@ def run(
                     line_width=line_width,
                 )
                 context_feature_count = sum(row["fov_feature_count"] for row in context_layer_rows)
+
+                # Exact SEG-contour -> feature coverage across every matrix layer.
+                # The percentage denominator is each SEG contour's own area.
+                all_layer_query = DefectContourQuery(all_fov_features)
+                all_layer_overlay_features: dict[str, tuple[str, object]] = {}
+                all_layer_overlay_intersections = []
+                for detection, defect_polygon in zip(detections, defect_polygons):
+                    contour_hits = sorted(
+                        all_layer_query.query(defect_polygon),
+                        key=lambda h: h.defect_overlap_pct,
+                        reverse=True,
+                    )
+                    coverage_rows = []
+                    for hit in contour_hits:
+                        coverage_rows.append(_feature_hit_row(hit))
+                        key = f"{hit.feature.layer}:{hit.feature.feature_id}"
+                        all_layer_overlay_features[key] = (
+                            hit.feature.primitive_type,
+                            geometry_to_cam_pixels(
+                                hit.feature.geometry,
+                                image_center_aoi_mm=center_aoi_mm,
+                                cam_size_px=cam_size,
+                                resolution_um_per_px=resolution_um_per_px,
+                                transform=aoi_odb_transform,
+                            ),
+                        )
+                        all_layer_overlay_intersections.append(
+                            geometry_to_cam_pixels(
+                                hit.intersection_geometry,
+                                image_center_aoi_mm=center_aoi_mm,
+                                cam_size_px=cam_size,
+                                resolution_um_per_px=resolution_um_per_px,
+                                transform=aoi_odb_transform,
+                            )
+                        )
+                    detection["odb_all_layers"] = {
+                        "contour_area_mm2": float(defect_polygon.area),
+                        "hit_count": len(contour_hits),
+                        "features": coverage_rows,
+                        "sum_contour_overlap_pct": float(
+                            sum(hit.defect_overlap_pct for hit in contour_hits)
+                        ),
+                        "percentage_note": (
+                            "Each contour_overlap_pct = intersection_area / SEG contour area * 100. "
+                            "Percentages can sum above 100 when geometries from different ODB layers overlap."
+                        ),
+                    }
+
                 active = [row for row in context_layer_rows if row["fov_feature_count"] > 0]
                 for row in active:
                     print(
@@ -420,8 +483,21 @@ def run(
                 )
                 intersection_output_path = output_dir / f"{cam_path.stem}_ODB_INTERSECTIONS.png"
                 intersection_overlay.save(intersection_output_path, format="PNG")
+
+                all_layers_intersection_output_path = None
+                if context_all_layers:
+                    all_layers_intersection_overlay = draw_odb_feature_overlay(
+                        cam_copy,
+                        seg_contours_px=cam_contours,
+                        feature_geometries=all_layer_overlay_features.values(),
+                        intersection_geometries=all_layer_overlay_intersections,
+                        line_width=line_width,
+                    )
+                    all_layers_intersection_output_path = output_dir / f"{cam_path.stem}_ODB_CONTOUR_FEATURE_COVERAGE_ALL_LAYERS.png"
+                    all_layers_intersection_overlay.save(all_layers_intersection_output_path, format="PNG")
             else:
                 intersection_output_path = None
+                all_layers_intersection_output_path = None
 
             items.append({
                 "source_image": str(source_path),
@@ -433,6 +509,7 @@ def run(
                 "odb_context_layers": context_layer_rows if odb_enabled and context_all_layers else None,
                 "odb_features_overlay_image": str(odb_output_path) if odb_output_path else None,
                 "odb_intersections_overlay_image": str(intersection_output_path) if intersection_output_path else None,
+                "odb_all_layers_contour_coverage_overlay_image": str(all_layers_intersection_output_path) if all_layers_intersection_output_path else None,
                 "source_size_px": list(source_size),
                 "cam_size_px": list(cam_size),
                 "aoi_center_mm": [aoi_x_mm, aoi_y_mm],
@@ -464,7 +541,8 @@ def run(
                 "overlay_policy": {
                     "ODB_CONTEXT": "all matrix layers intersecting the CAM field of view when --context-all-layers is enabled; otherwise selected signal layer only; visualization only",
                     "ODB_FEATURES": "ODB features with positive-area exact SEG-contour intersection",
-                    "ODB_INTERSECTIONS": "exact SEG/ODB intersection geometry",
+                    "ODB_INTERSECTIONS": "exact SEG/ODB intersection geometry on the selected recipe signal layer",
+                    "ODB_CONTOUR_FEATURE_COVERAGE_ALL_LAYERS": "exact positive-area intersections between each SEG contour and FOV features from every matrix layer; each feature reports intersection_area / contour_area * 100",
                 },
             },
             "items": items,
