@@ -9,13 +9,14 @@ from typing import Any
 
 from PIL import Image
 
+from app_core import inspect_job
 from aoi.contour_mapping import AoiOdbTransform, CropGeometry, contour_pixel_to_odb_polygon
 from aoi.odb_cam_feature_overlay import draw_odb_feature_overlay, geometry_to_cam_pixels
 from aoi.seg_cam_overlay import discover_gid_pairs, draw_contours_on_cam, map_contour_by_shared_center, parse_coordinate_key
 from hierarchy_renderer import FastODBRenderer
 from odb.feature_query import DefectContourQuery, extract_vector_features
 from odb_cam_renderer import extract_input
-from render.roi import select_roi_layers
+from render.roi import _feature_diagnostics, select_roi_layers
 
 
 def _resolve_model(model_arg: Path | None, models_dir: Path) -> Path:
@@ -73,7 +74,101 @@ def _prepare_odb(odb_input: Path, recipe_layer: str, root_step: str):
     selection = select_roi_layers(job, recipe_layer)
     renderer = FastODBRenderer(job, dpi=100.0)
     features = extract_vector_features(renderer, root_step, [selection.signal_layer], positive_only=False)
-    return temp_dir, selection.signal_layer, features, DefectContourQuery(features)
+    return temp_dir, job, renderer, selection.signal_layer, features, DefectContourQuery(features)
+
+
+def _safe_layer_name(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(name))
+
+
+def _primitive_total(diag: dict) -> int:
+    counts = diag.get("roi_primitive_counts", {})
+    return int(counts.get("pads", 0)) + int(counts.get("lines", 0)) + int(counts.get("surfaces", 0))
+
+
+def _context_layer_sweep(
+    *,
+    job: Path,
+    renderer: FastODBRenderer,
+    root_step: str,
+    cam_fov_polygon,
+    center_aoi_mm,
+    cam_size,
+    resolution_um_per_px: float,
+    transform: AoiOdbTransform,
+    cam_image: Image.Image,
+    seg_contours,
+    output_dir: Path,
+    cam_stem: str,
+    line_width: int,
+):
+    """Inspect every ODB matrix layer at the fixed CAM FOV.
+
+    This is diagnostic/visualization only. It never changes the signal-layer
+    DefectContourQuery used for exact defect/spec intersections.
+    """
+    info = inspect_job(job)
+    available_steps = tuple(
+        p.name.lower() for p in (job / "steps").iterdir() if p.is_dir()
+    )
+    bounds_in = tuple(float(v) / 25.4 for v in cam_fov_polygon.bounds)
+
+    rows = []
+    combined: dict[str, tuple[str, object]] = {}
+    for layer in info.layers:
+        diag = _feature_diagnostics(
+            renderer,
+            root_step,
+            layer.name,
+            available_steps,
+            bounds_in,
+            resolution_um_per_px,
+            max_samples=0,
+        )
+        primitive_count = _primitive_total(diag)
+        row = {
+            "name": layer.name,
+            "type": layer.layer_type,
+            "context": layer.context,
+            "side": layer.side,
+            "polarity": layer.polarity,
+            "prefilter_primitive_count": primitive_count,
+            "fov_feature_count": 0,
+            "overlay_image": None,
+        }
+        if primitive_count > 0:
+            layer_features = extract_vector_features(
+                renderer, root_step, [layer.name], positive_only=False
+            )
+            layer_hits = DefectContourQuery(layer_features).query(cam_fov_polygon)
+            row["fov_feature_count"] = len(layer_hits)
+
+            layer_overlay_features: dict[str, tuple[str, object]] = {}
+            for hit in layer_hits:
+                feature_cam = geometry_to_cam_pixels(
+                    hit.feature.geometry,
+                    image_center_aoi_mm=center_aoi_mm,
+                    cam_size_px=cam_size,
+                    resolution_um_per_px=resolution_um_per_px,
+                    transform=transform,
+                )
+                key = f"{layer.name}:{hit.feature.feature_id}"
+                layer_overlay_features[key] = (hit.feature.primitive_type, feature_cam)
+                combined[key] = (hit.feature.primitive_type, feature_cam)
+
+            if layer_overlay_features:
+                layer_overlay = draw_odb_feature_overlay(
+                    cam_image,
+                    seg_contours_px=seg_contours,
+                    feature_geometries=layer_overlay_features.values(),
+                    line_width=line_width,
+                )
+                layer_path = output_dir / f"{cam_stem}_ODB_CONTEXT_{_safe_layer_name(layer.name)}.png"
+                layer_overlay.save(layer_path, format="PNG")
+                row["overlay_image"] = str(layer_path)
+        rows.append(row)
+
+    return rows, combined
 
 
 def _cam_fov_odb_polygon(cam_size, center_aoi_mm, resolution_um_per_px, transform):
@@ -104,6 +199,7 @@ def run(
     tx_mm: float | None = None,
     ty_mm: float | None = None,
     root_step: str = "pnl",
+    context_all_layers: bool = False,
 ) -> dict:
     if not 0.0 <= conf <= 1.0:
         raise ValueError("conf must be between 0 and 1")
@@ -125,11 +221,13 @@ def run(
     model = _load_yolo(model_path)
 
     temp_dir = None
+    job = None
+    renderer = None
     signal_layer = None
     features = []
     query = None
     if odb_enabled:
-        temp_dir, signal_layer, features, query = _prepare_odb(odb_input, recipe_layer, root_step)
+        temp_dir, job, renderer, signal_layer, features, query = _prepare_odb(odb_input, recipe_layer, root_step)
         print(f"ODB signal layer: {signal_layer}")
         print(f"ODB features    : {len(features)}")
 
@@ -159,6 +257,7 @@ def run(
             overlay_intersections = []
             context_features: dict[str, tuple[str, object]] = {}
             context_feature_count = 0
+            context_layer_rows = []
 
             masks = getattr(result, "masks", None)
             segments = [] if masks is None else list(masks.xy)
@@ -183,19 +282,46 @@ def run(
                 cam_fov_polygon = _cam_fov_odb_polygon(
                     cam_size, center_aoi_mm, resolution_um_per_px, aoi_odb_transform
                 )
-                context_hits = query.query(cam_fov_polygon)
-                context_feature_count = len(context_hits)
-                for context_hit in context_hits:
-                    context_cam = geometry_to_cam_pixels(
-                        context_hit.feature.geometry,
-                        image_center_aoi_mm=center_aoi_mm,
-                        cam_size_px=cam_size,
+                if context_all_layers:
+                    print("ODB context layer sweep: prefiltering all matrix layers at fixed CAM FOV...", flush=True)
+                    context_layer_rows, context_features = _context_layer_sweep(
+                        job=job,
+                        renderer=renderer,
+                        root_step=root_step,
+                        cam_fov_polygon=cam_fov_polygon,
+                        center_aoi_mm=center_aoi_mm,
+                        cam_size=cam_size,
                         resolution_um_per_px=resolution_um_per_px,
                         transform=aoi_odb_transform,
+                        cam_image=cam_copy,
+                        seg_contours=cam_contours,
+                        output_dir=output_dir,
+                        cam_stem=cam_path.stem,
+                        line_width=line_width,
                     )
-                    context_features[context_hit.feature.feature_id] = (
-                        context_hit.feature.primitive_type, context_cam
-                    )
+                    context_feature_count = sum(row["fov_feature_count"] for row in context_layer_rows)
+                    active = [row for row in context_layer_rows if row["fov_feature_count"] > 0]
+                    for row in active:
+                        print(
+                            f"  {row['name']} [{row['type']}] FOV features={row['fov_feature_count']}",
+                            flush=True,
+                        )
+                    if not active:
+                        print("  No supported P/L/S geometry found in CAM FOV on any matrix layer.", flush=True)
+                else:
+                    context_hits = query.query(cam_fov_polygon)
+                    context_feature_count = len(context_hits)
+                    for context_hit in context_hits:
+                        context_cam = geometry_to_cam_pixels(
+                            context_hit.feature.geometry,
+                            image_center_aoi_mm=center_aoi_mm,
+                            cam_size_px=cam_size,
+                            resolution_um_per_px=resolution_um_per_px,
+                            transform=aoi_odb_transform,
+                        )
+                        context_features[context_hit.feature.feature_id] = (
+                            context_hit.feature.primitive_type, context_cam
+                        )
 
             for index, segment in enumerate(segments):
                 source_contour = _to_python_contour(segment)
@@ -300,6 +426,7 @@ def run(
                 "seg_overlay_image": str(seg_output_path),
                 "odb_context_overlay_image": str(odb_context_output_path) if odb_context_output_path else None,
                 "odb_context_feature_count": context_feature_count if odb_enabled else None,
+                "odb_context_layers": context_layer_rows if odb_enabled and context_all_layers else None,
                 "odb_features_overlay_image": str(odb_output_path) if odb_output_path else None,
                 "odb_intersections_overlay_image": str(intersection_output_path) if intersection_output_path else None,
                 "source_size_px": list(source_size),
@@ -327,9 +454,11 @@ def run(
                 "orientation": "SWAP_X+_Y-",
                 "tx_mm": tx_mm,
                 "ty_mm": ty_mm,
+                "context_all_layers": context_all_layers,
+                "exact_defect_query_layer": signal_layer,
                 "overlay_legend": {"SEG": "red", "P": "cyan", "L": "yellow", "S": "magenta", "intersection": "green"},
                 "overlay_policy": {
-                    "ODB_CONTEXT": "all ODB features intersecting the CAM field of view; visualization only",
+                    "ODB_CONTEXT": "all matrix layers intersecting the CAM field of view when --context-all-layers is enabled; otherwise selected signal layer only; visualization only",
                     "ODB_FEATURES": "ODB features with positive-area exact SEG-contour intersection",
                     "ODB_INTERSECTIONS": "exact SEG/ODB intersection geometry",
                 },
@@ -366,6 +495,11 @@ def main() -> int:
     parser.add_argument("--tx-mm", type=float, default=None)
     parser.add_argument("--ty-mm", type=float, default=None)
     parser.add_argument("--root-step", default="pnl")
+    parser.add_argument(
+        "--context-all-layers",
+        action="store_true",
+        help="Diagnostic only: sweep every ODB matrix layer in the fixed CAM FOV and save per-layer context overlays. Exact defect/spec intersection remains on the selected recipe signal layer.",
+    )
     args = parser.parse_args()
 
     model_path = _resolve_model(args.model, args.models_dir)
@@ -376,6 +510,7 @@ def main() -> int:
         odb_input=args.odb_input, recipe_layer=args.recipe_layer,
         resolution_um_per_px=args.resolution_um_per_px,
         tx_mm=args.tx_mm, ty_mm=args.ty_mm, root_step=args.root_step,
+        context_all_layers=args.context_all_layers,
     )
     return 0
 
